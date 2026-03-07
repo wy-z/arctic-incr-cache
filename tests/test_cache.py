@@ -80,6 +80,19 @@ class TestCacheHit:
 
         assert len(result) == 10
 
+    def test_fresh_but_short_fetches_more(self, lib):
+        """When cache is fresh but has fewer rows than count, fetch to fill."""
+        lib.has_symbol.return_value = True
+        # Cache has 5 rows ending on the requested end date (fresh but short)
+        lib.read.return_value.data = _daily_df("2024-01-11", 5)
+
+        full = _daily_df("2024-01-01", 15)
+        cache = _make_cache(lib, full)
+        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
+
+        assert len(result) == 10
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+
 
 # ── incremental update ───────────────────────────────────────────
 

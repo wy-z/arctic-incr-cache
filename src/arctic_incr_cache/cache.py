@@ -210,9 +210,18 @@ class IncrCache:
             count = self.default_count
         if count <= 0:
             return pd.DataFrame()
-        start_ts = end_ts - pd.Timedelta(minutes=count * self.bar_minutes * 2)
+        # For intraday, account for overnight gaps and weekends (≈7x);
+        # for daily, 2x handles weekends and holidays.
+        lookback = 2 if self.is_daily else 7
+        start_ts = end_ts - pd.Timedelta(minutes=count * self.bar_minutes * lookback)
         existing = self._read(symbol, (start_ts, end_ts))
         end_naive = end_ts.tz_localize(None) if tz else end_ts
+
+        def trim(df: pd.DataFrame) -> pd.DataFrame:
+            return _trim(df, end_naive, count)
+
+        def merge(*dfs: pd.DataFrame) -> pd.DataFrame:
+            return trim(_normalize(pd.concat(dfs)))
 
         # Cache miss
         if existing.empty:
@@ -220,25 +229,34 @@ class IncrCache:
             df = _normalize(self._fetch(symbol, end_ts, count))
             if not df.empty:
                 self._store(symbol, df)
-            return _trim(df, end_naive, count)
+            return trim(df)
 
-        # Fresh
+        # Fresh — but fall through if we have fewer rows than requested
         last = existing.index[-1]
         if self._is_fresh(last, end_naive, tz):
-            return _trim(existing, end_naive, count)
+            trimmed = trim(existing)
+            if len(trimmed) >= count:
+                return trimmed
+            # Not enough rows cached; fetch full count
+            log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
+            df = _normalize(self._fetch(symbol, end_ts, count))
+            if not df.empty:
+                self._store(symbol, df)
+                return merge(existing, df)
+            return trimmed
 
         # Incremental update
         gap = int((end_naive - last).total_seconds() / 60 / self.bar_minutes) + 1
         log.info("update %s: %s -> %s", symbol, last.date(), end_naive.date())
         new = _normalize(self._fetch(symbol, end_ts, gap))
         if new.empty:
-            return _trim(existing, end_naive, count)
+            return trim(existing)
 
         new = new.loc[new.index >= last]
         if last in new.index and new.loc[last].equals(existing.loc[last]):
             new = new.iloc[1:]
         if new.empty:
-            return _trim(existing, end_naive, count)
+            return trim(existing)
 
         self._store(symbol, new)
-        return _trim(_normalize(pd.concat([existing, new])), end_naive, count)
+        return merge(existing, new)
