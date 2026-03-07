@@ -2,22 +2,26 @@
 
 import datetime
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 from arctic_incr_cache import IncrCache
 
+_UTC = ZoneInfo("UTC")
+_NY = ZoneInfo("America/New_York")
+
 # ── helpers ──────────────────────────────────────────────────────
 
 
 def _daily_df(start, n, value_start=100):
-    dates = pd.date_range(start=start, periods=n, freq="D")
+    dates = pd.date_range(start=start, periods=n, freq="D", tz=_UTC)
     return pd.DataFrame({"value": range(value_start, value_start + n)}, index=dates)
 
 
 def _intraday_df(start, n):
-    times = pd.date_range(start=start, periods=n, freq="1min")
+    times = pd.date_range(start=start, periods=n, freq="1min", tz=_UTC)
     return pd.DataFrame({"price": range(n)}, index=times)
 
 
@@ -27,14 +31,14 @@ def _make_cache(
     *,
     bar_minutes: int = 1440,
     default_count: int = 252,
-    get_tz=None,
+    get_tz=lambda _: _UTC,
 ):
     """Build an IncrCache with a mock library and canned fetch data."""
     data = fetch_data if fetch_data is not None else pd.DataFrame()
     fetch = MagicMock(return_value=data)
     return IncrCache(
         lib, fetch,
-        bar_minutes=bar_minutes, default_count=default_count, get_tz=get_tz,
+        get_tz=get_tz, bar_minutes=bar_minutes, default_count=default_count,
     )
 
 
@@ -121,7 +125,7 @@ class TestIncrementalUpdate:
         cache.get("S", end=datetime.date(2024, 1, 20), count=15)
 
         stored = lib.update.call_args[0][1]
-        assert pd.Timestamp("2024-01-10") not in stored.index
+        assert pd.Timestamp("2024-01-10", tz=_UTC) not in stored.index
 
     def test_keeps_changed_overlap(self, lib):
         cached = _daily_df("2024-01-01", 10)
@@ -129,14 +133,15 @@ class TestIncrementalUpdate:
         lib.read.return_value.data = cached
 
         changed = pd.DataFrame(
-            {"value": [999]}, index=pd.DatetimeIndex([pd.Timestamp("2024-01-10")])
+            {"value": [999]},
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-10", tz=_UTC)]),
         )
         new_part = _daily_df("2024-01-11", 5, value_start=500)
         cache = _make_cache(lib, pd.concat([changed, new_part]))
         cache.get("S", end=datetime.date(2024, 1, 20), count=15)
 
         stored = lib.update.call_args[0][1]
-        assert pd.Timestamp("2024-01-10") in stored.index
+        assert pd.Timestamp("2024-01-10", tz=_UTC) in stored.index
 
     def test_empty_source_returns_existing(self, lib):
         cached = _daily_df("2024-01-01", 10)
@@ -161,7 +166,7 @@ class TestIncompleteBarExclusion:
         cache.get("S", count=10)
 
         stored = lib.update.call_args[0][1]
-        assert stored.index[-1] < pd.Timestamp(today)
+        assert stored.index[-1] < pd.Timestamp.now(_UTC).normalize()
 
 
 # ── intraday ─────────────────────────────────────────────────────
@@ -171,7 +176,8 @@ class TestIntraday:
     def test_cache_miss(self, lib):
         df = _intraday_df("2024-01-15 09:30", 360)
         cache = _make_cache(lib, df, bar_minutes=1, default_count=1950)
-        result = cache.get("S", end=datetime.datetime(2024, 1, 15, 15, 30), count=100)
+        end = datetime.datetime(2024, 1, 15, 15, 30, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=100)
 
         assert len(result) == 100
         lib.update.assert_called_once()
@@ -183,7 +189,8 @@ class TestIntraday:
 
         new = _intraday_df("2024-01-15 11:59", 212)
         cache = _make_cache(lib, new, bar_minutes=1, default_count=1950)
-        result = cache.get("S", end=datetime.datetime(2024, 1, 15, 15, 30), count=500)
+        end = datetime.datetime(2024, 1, 15, 15, 30, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=500)
 
         assert not result.empty
 
@@ -193,39 +200,29 @@ class TestIntraday:
 
 class TestTimezoneEndToEnd:
     def test_store_localizes_to_configured_tz(self, lib):
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo("America/New_York")
         df = _intraday_df("2024-01-15 09:30", 60)
         cache = _make_cache(
-            lib, df, bar_minutes=1, default_count=1950, get_tz=lambda _: tz
+            lib, df, bar_minutes=1, default_count=1950, get_tz=lambda _: _NY
         )
-        cache.get("S", end=datetime.datetime(2024, 1, 15, 10, 30), count=30)
+        end = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=_UTC)
+        cache.get("S", end=end, count=30)
 
         stored = lib.update.call_args[0][1]
-        assert pd.DatetimeIndex(stored.index).tz is not None
         assert str(pd.DatetimeIndex(stored.index).tz) == "America/New_York"
 
-    def test_read_returns_naive_in_configured_tz(self, lib):
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo("America/New_York")
-        # Simulate ArcticDB returning tz-aware data in NY
+    def test_read_returns_tz_aware_in_configured_tz(self, lib):
         raw = _intraday_df("2024-01-15 09:30", 60)
-        raw.index = pd.DatetimeIndex(raw.index).tz_localize(tz)
+        raw.index = pd.DatetimeIndex(raw.index).tz_convert(_NY)
         lib.has_symbol.return_value = True
         lib.read.return_value.data = raw
 
         cache = _make_cache(
-            lib, bar_minutes=1, default_count=1950, get_tz=lambda _: tz
+            lib, bar_minutes=1, default_count=1950, get_tz=lambda _: _NY
         )
-        result = cache.get(
-            "S", end=datetime.datetime(2024, 1, 15, 10, 30), count=30
-        )
+        end = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=30)
 
-        assert pd.DatetimeIndex(result.index).tz is None
-        # Wall-clock time preserved (not UTC-converted: 09:30 NY != 14:30 UTC)
-        assert result.index[0] < pd.Timestamp("2024-01-15 12:00:00")
+        assert str(pd.DatetimeIndex(result.index).tz) == "America/New_York"
 
 
 # ── normalize ────────────────────────────────────────────────────
@@ -236,9 +233,29 @@ class TestNormalize:
         from arctic_incr_cache.cache import _normalize
 
         df = _daily_df("2024-01-01", 5)
-        df.index = pd.DatetimeIndex(df.index).tz_localize("UTC")
         result = _normalize(df)
         assert pd.DatetimeIndex(result.index).tz is None
+
+    def test_naive_raises_when_tz_provided(self):
+        from arctic_incr_cache.cache import _normalize
+
+        df = pd.DataFrame(
+            {"v": [1]},
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-15 12:00")]),
+        )
+        with pytest.raises(ValueError, match="tz-aware"):
+            _normalize(df, tz=_NY)
+
+    def test_aware_converted_to_target_tz(self):
+        from arctic_incr_cache.cache import _normalize
+
+        df = pd.DataFrame(
+            {"v": [1]},
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-15", tz="UTC")]),
+        )
+        result = _normalize(df, tz=_NY)
+        assert str(pd.DatetimeIndex(result.index).tz) == "America/New_York"
+        assert result.index[0] == pd.Timestamp("2024-01-14 19:00", tz=_NY)
 
     def test_deduplicates_keeping_last(self):
         from arctic_incr_cache.cache import _normalize
@@ -264,17 +281,17 @@ class TestTrim:
         from arctic_incr_cache.cache import _trim
 
         df = _daily_df("2024-01-01", 20)
-        result = _trim(df, pd.Timestamp("2024-01-20"), 5)
+        result = _trim(df, pd.Timestamp("2024-01-20", tz=_UTC), 5)
         assert len(result) == 5
-        assert result.index[-1] == pd.Timestamp("2024-01-20")
+        assert result.index[-1] == pd.Timestamp("2024-01-20", tz=_UTC)
 
     def test_filters_by_end_ts(self):
         from arctic_incr_cache.cache import _trim
 
         df = _daily_df("2024-01-01", 20)
-        result = _trim(df, pd.Timestamp("2024-01-10"), 1000)
+        result = _trim(df, pd.Timestamp("2024-01-10", tz=_UTC), 1000)
         assert len(result) == 10
-        assert result.index[-1] == pd.Timestamp("2024-01-10")
+        assert result.index[-1] == pd.Timestamp("2024-01-10", tz=_UTC)
 
     def test_empty_passthrough(self):
         from arctic_incr_cache.cache import _trim
@@ -289,17 +306,32 @@ class TestTrim:
 class TestResolveEnd:
     def test_date_becomes_end_of_day(self):
         cache = _make_cache(MagicMock())
-        result = cache._resolve_end(datetime.date(2024, 1, 15), tz=None)
-        assert result == pd.Timestamp("2024-01-15 23:59:59.999999")
+        result = cache._resolve_end(datetime.date(2024, 1, 15), tz=_UTC)
+        assert result == pd.Timestamp("2024-01-15 23:59:59.999999", tz=_UTC)
 
-    def test_datetime_passes_through(self):
+    def test_naive_datetime_localized_as_local(self):
         cache = _make_cache(MagicMock())
-        result = cache._resolve_end(datetime.datetime(2024, 1, 15, 14, 30), tz=None)
-        assert result == pd.Timestamp("2024-01-15 14:30:00")
+        naive = datetime.datetime(2024, 1, 15, 14, 30)
+        result = cache._resolve_end(naive, tz=_UTC)
+        expected = pd.Timestamp(naive.astimezone()).tz_convert(_UTC)
+        assert result == expected
+
+    def test_naive_pd_timestamp_localized_as_local(self):
+        cache = _make_cache(MagicMock())
+        naive_ts = pd.Timestamp("2024-01-15 14:30")
+        result = cache._resolve_end(naive_ts, tz=_UTC)
+        expected = pd.Timestamp(naive_ts.to_pydatetime().astimezone()).tz_convert(_UTC)
+        assert result == expected
+
+    def test_aware_datetime_converted(self):
+        cache = _make_cache(MagicMock())
+        aware = datetime.datetime(2024, 1, 15, 14, 30, tzinfo=_NY)
+        result = cache._resolve_end(aware, tz=_UTC)
+        assert result == pd.Timestamp("2024-01-15 14:30:00", tz=_NY).tz_convert(_UTC)
 
     def test_none_defaults_to_now(self):
         cache = _make_cache(MagicMock())
-        result = cache._resolve_end(None, tz=None)
+        result = cache._resolve_end(None, tz=_UTC)
         assert result.date() == datetime.date.today()
 
 

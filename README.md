@@ -20,6 +20,7 @@ uv add arctic-incr-cache
 ```python
 import datetime
 import arcticdb as adb
+from zoneinfo import ZoneInfo
 from arctic_incr_cache import IncrCache
 
 arctic = adb.Arctic("lmdb://data/arcticdb")
@@ -28,6 +29,7 @@ lib = arctic.get_library("ohlcv-1d", create_if_missing=True)
 cache = IncrCache(
     lib,
     fetch=lambda symbol, end, count: your_api.get_daily_bars(symbol, end=end, count=count),
+    get_tz=lambda symbol: ZoneInfo("America/New_York"),
 )
 
 df = cache.get("AAPL", end=datetime.date(2024, 6, 1), count=60)
@@ -71,15 +73,24 @@ cache = IncrCache(
 )
 ```
 
+## Timezone handling
+
+When `get_tz` returns a timezone for a symbol:
+
+- **`fetch` return** — must be tz-aware. Timestamps are converted to the configured market timezone internally.
+- **Storage** — data is stored in ArcticDB as tz-aware in the configured timezone.
+- **Return** — `get()` returns a tz-aware DataFrame in the configured timezone.
+- **`end` parameter** — `date` becomes end-of-day in market timezone; naive `datetime` is interpreted as **local timezone**, then converted; tz-aware is converted directly.
+
 ## Constructor parameters
 
 | Parameter | Required | Description |
 |---|---|---|
 | `library` | yes | ArcticDB library instance |
-| `fetch(symbol, end, count)` | yes | Fetch raw data from upstream; return tz-naive local-time DataFrame |
+| `fetch(symbol, end, count)` | yes | Fetch raw data from upstream; must return tz-aware timestamps |
+| `get_tz(symbol)` | yes | Market timezone (`tzinfo`) for each symbol |
 | `bar_minutes` | no | Bar width in minutes (default 1440 = daily) |
 | `default_count` | no | Bars returned when `count` is omitted (default 252) |
-| `get_tz(symbol)` | no | Market timezone (`tzinfo`) or `None` for daily (default: `None`) |
 | `spawn` | no | Fire-and-forget callable for async writes (default: daemon thread) |
 | `lock_class` | no | Lock constructor (default: `threading.Lock`) |
 

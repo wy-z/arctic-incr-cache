@@ -2,6 +2,7 @@
 
 import datetime
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -9,17 +10,19 @@ from pytest_bdd import given, parsers, then, when
 
 from arctic_incr_cache import IncrCache
 
+_UTC = ZoneInfo("UTC")
+
 
 # ── helpers ───────────────────────────────────────────────────────
 
 
 def daily_df(start, n, value_start=100):
-    dates = pd.date_range(start=start, periods=n, freq="D")
+    dates = pd.date_range(start=start, periods=n, freq="D", tz=_UTC)
     return pd.DataFrame({"value": range(value_start, value_start + n)}, index=dates)
 
 
 def intraday_df(start, n):
-    times = pd.date_range(start=start, periods=n, freq="1min")
+    times = pd.date_range(start=start, periods=n, freq="1min", tz=_UTC)
     return pd.DataFrame({"price": range(n)}, index=times)
 
 
@@ -66,7 +69,9 @@ def _lib_with_daily(ctx, n, start):
 def _request_bars(ctx, count, symbol, end):
     fetch = MagicMock(return_value=ctx.get("fetch_data", pd.DataFrame()))
     ctx["fetch"] = fetch
-    cache = IncrCache(ctx["lib"], fetch, bar_minutes=1440, default_count=252)
+    cache = IncrCache(
+        ctx["lib"], fetch, get_tz=lambda _: _UTC, bar_minutes=1440, default_count=252
+    )
     ctx["result"] = cache.get(
         symbol, end=datetime.date.fromisoformat(end), count=count
     )

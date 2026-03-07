@@ -33,12 +33,13 @@ Single-module library: `src/arctic_incr_cache/cache.py`.
 
 When `get_tz` returns a timezone for a symbol:
 
-- **Storage** — data is stored in ArcticDB in the configured timezone (e.g., `America/New_York`), via `_store()` calling `tz_localize(tz)`.
-- **Queries** — all request parameters (`end`) are converted to the configured timezone by `_resolve_end()` before reading or comparing. Naive datetime inputs are interpreted as the configured timezone; aware inputs are converted to it.
-- **Internal processing** — after reading from ArcticDB, `_normalize()` strips the timezone (keeping wall-clock time), so all comparisons happen in tz-naive configured-timezone time.
-- **Fetch contract** — `fetch()` must return a tz-naive DataFrame whose timestamps represent wall-clock time in the configured timezone.
+- **Fetch contract** — `fetch()` must return a tz-aware DataFrame. `_normalize(df, tz)` converts to the configured market timezone.
+- **Storage** — data is stored in ArcticDB as tz-aware in the configured timezone. `_store()` receives already-converted data from `_normalize()`.
+- **Queries** — `end` parameter: naive datetime is interpreted as **local timezone**, then converted to market timezone via `_resolve_end()`. Aware inputs are converted directly.
+- **Return** — `get()` returns a tz-aware DataFrame in the configured timezone.
+- **Internal processing** — all comparisons happen in tz-aware configured-timezone time.
 
-When `get_tz` returns `None` (daily data), everything stays tz-naive.
+`get_tz` is required — every symbol must have a configured timezone.
 
 ### Other design details
 

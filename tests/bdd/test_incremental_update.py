@@ -1,9 +1,13 @@
 """Incremental update scenarios + overlap-specific steps."""
 
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 from pytest_bdd import given, parsers, scenarios, then
 
 from .conftest import daily_df
+
+_UTC = ZoneInfo("UTC")
 
 scenarios("incremental_update.feature")
 
@@ -48,10 +52,10 @@ def _upstream_changed_overlap(ctx, n, start):
 @then(parsers.parse('the stored data does not contain "{date}"'))
 def _stored_missing(ctx, date):
     stored = ctx["lib"].update.call_args[0][1]
-    assert pd.Timestamp(date) not in stored.index
+    assert pd.Timestamp(date, tz=_UTC) not in stored.index
 
 
 @then(parsers.parse('the stored data contains "{date}"'))
 def _stored_has(ctx, date):
     stored = ctx["lib"].update.call_args[0][1]
-    assert pd.Timestamp(date) in stored.index
+    assert pd.Timestamp(date, tz=_UTC) in stored.index

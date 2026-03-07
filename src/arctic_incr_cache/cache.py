@@ -2,15 +2,15 @@
 
 Timezone handling
 -----------------
-When ``get_tz`` returns a timezone for a symbol:
+Every symbol has a configured timezone via ``get_tz(symbol) -> tzinfo``.
 
-* **Storage** — data is stored in ArcticDB in the configured timezone.
-* **Queries** — all request parameters (``end``, ``count``) are first
-  converted to the configured timezone before reading or comparing.
-* **Fetch contract** — ``fetch()`` must return a tz-naive DataFrame whose
-  timestamps represent wall-clock time in the configured timezone.
+* **Storage** — data is stored in ArcticDB as tz-aware in the configured
+  timezone (e.g., ``America/New_York``).
+* **Fetch contract** — ``fetch()`` must return a tz-aware DataFrame.
+  Timestamps are converted to the configured timezone internally.
 
-When ``get_tz`` returns ``None`` (daily data), everything stays tz-naive.
+* **Return** — ``get()`` returns a tz-aware DataFrame in the configured
+  timezone.
 """
 
 import datetime
@@ -27,12 +27,24 @@ log = logging.getLogger(__name__)
 # ── pure helpers ──────────────────────────────────────────────────
 
 
-def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip timezone (keeping wall-clock time), deduplicate (keep last), sort."""
+def _normalize(df: pd.DataFrame, tz: datetime.tzinfo | None = None) -> pd.DataFrame:
+    """Convert to *tz*-aware, deduplicate (keep last), sort.
+
+    *tz* provided → tz-aware input is converted; tz-naive input raises.
+    *tz* is ``None`` → tz-aware input is stripped (keep wall-clock);
+    tz-naive input passes through unchanged.
+    """
     if df.empty:
         return df
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        df = df.set_axis(df.index.tz_localize(None))
+    if isinstance(df.index, pd.DatetimeIndex):
+        if tz:
+            if df.index.tz is None:
+                raise ValueError(
+                    "fetch() must return tz-aware timestamps, got tz-naive"
+                )
+            df = df.set_axis(df.index.tz_convert(tz))
+        elif df.index.tz is not None:
+            df = df.set_axis(df.index.tz_localize(None))
     return df.loc[~df.index.duplicated(keep="last")].sort_index()
 
 
@@ -51,18 +63,17 @@ class IncrCache:
 
     Data is stored in the configured timezone (via ``get_tz``).  All request
     parameters are converted to that timezone before querying ArcticDB.
-    Internal comparisons use tz-naive timestamps in the configured timezone's
-    wall-clock time.
+    Internal comparisons use tz-aware timestamps in the configured timezone.
 
     Args:
         library: ArcticDB library instance.
         fetch: ``fetch(symbol, end, count) -> DataFrame``.
-            Must return a tz-naive DataFrame in the configured timezone's
-            wall-clock time.
+            Must return a tz-aware DataFrame.  Timestamps are converted
+            to the configured timezone internally.
+        get_tz: ``get_tz(symbol) -> tzinfo``.
+            Determines the storage/comparison timezone for each symbol.
         bar_minutes: Bar width in minutes (1440 = daily, 1 = 1-min).
         default_count: Bars returned when *count* is omitted.
-        get_tz: ``get_tz(symbol) -> tzinfo | None``.
-            Determines the storage timezone.  Return ``None`` for daily data.
         spawn: Fire-and-forget callable for async writes.
             Defaults to daemon threads.  Pass ``gevent.spawn`` for async runtimes.
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
@@ -73,9 +84,9 @@ class IncrCache:
         library: Any,
         fetch: Callable[[str, pd.Timestamp, int], pd.DataFrame],
         *,
+        get_tz: Callable[[str], datetime.tzinfo],
         bar_minutes: int = 1440,
         default_count: int = 252,
-        get_tz: Callable[[str], datetime.tzinfo | None] | None = None,
         spawn: Callable[..., Any] | None = None,
         lock_class: type | None = None,
     ):
@@ -83,9 +94,9 @@ class IncrCache:
             raise ValueError("bar_minutes must be > 0")
         self._lib = library
         self._fetch = fetch
+        self._get_tz = get_tz
         self.bar_minutes = bar_minutes
         self.default_count = default_count
-        self._get_tz = get_tz or (lambda _: None)
         self._spawn = spawn
         self._lock_class = lock_class or threading.Lock
         self._locks: dict[str, Any] = {}
@@ -98,44 +109,34 @@ class IncrCache:
     # ── time helpers ──────────────────────────────────────────────
 
     def _resolve_end(
-        self, end: datetime.date | datetime.datetime | None, tz: datetime.tzinfo | None
+        self, end: datetime.date | datetime.datetime | None, tz: datetime.tzinfo
     ) -> pd.Timestamp:
-        """Normalize *end* to a ``pd.Timestamp`` in the configured timezone.
+        """Normalize *end* to a tz-aware ``pd.Timestamp`` in *tz*.
 
-        Naive datetime inputs are interpreted as the configured timezone.
-        Aware datetime inputs are converted to it.
+        ``date`` inputs become end-of-day in the configured timezone.
+        Naive ``datetime`` inputs are interpreted as **local timezone**,
+        then converted to the configured timezone.
+        Aware ``datetime`` inputs are converted directly.
         """
         if end is None:
-            if tz:
-                return pd.Timestamp.now(tz)
-            return pd.Timestamp(
-                datetime.date.today() if self.is_daily else datetime.datetime.now()
-            )
+            return pd.Timestamp.now(tz)
         if type(end) is datetime.date:
             return pd.Timestamp(
                 datetime.datetime.combine(end, datetime.time.max), tz=tz
             )
         ts = pd.Timestamp(end)
-        if tz:
-            return (ts if ts.tzinfo else ts.tz_localize(tz)).tz_convert(tz)
-        return ts.tz_localize(None) if ts.tzinfo else ts
+        if ts.tzinfo:
+            return ts.tz_convert(tz)
+        return pd.Timestamp(ts.to_pydatetime().astimezone()).tz_convert(tz)
 
-    def _incomplete_threshold(
-        self, tz: datetime.tzinfo | None = None
-    ) -> pd.Timestamp:
-        """Bars at or after this naive timestamp may still be updating.
-
-        For intraday data with a timezone, uses ``now(tz)`` so the threshold
-        is in the configured timezone's wall-clock time — matching the naive
-        timestamps used throughout internal comparisons.
-        """
+    def _incomplete_threshold(self, tz: datetime.tzinfo) -> pd.Timestamp:
+        """Bars at or after this tz-aware timestamp may still be updating."""
         if self.is_daily:
-            return pd.Timestamp(datetime.date.today())
-        now = pd.Timestamp.now(tz).tz_localize(None) if tz else pd.Timestamp.now()
-        return now - pd.Timedelta(minutes=self.bar_minutes)
+            return pd.Timestamp.now(tz).normalize()
+        return pd.Timestamp.now(tz) - pd.Timedelta(minutes=self.bar_minutes)
 
     def _is_fresh(
-        self, last: pd.Timestamp, end: pd.Timestamp, tz: datetime.tzinfo | None = None
+        self, last: pd.Timestamp, end: pd.Timestamp, tz: datetime.tzinfo
     ) -> bool:
         threshold = self._incomplete_threshold(tz)
         backoff = (
@@ -152,11 +153,13 @@ class IncrCache:
         with self._meta_lock:
             return self._locks.setdefault(symbol, self._lock_class())
 
-    def _read(self, symbol: str, date_range: tuple) -> pd.DataFrame:
+    def _read(
+        self, symbol: str, date_range: tuple, tz: datetime.tzinfo
+    ) -> pd.DataFrame:
         if not self._lib.has_symbol(symbol):
             return pd.DataFrame()
         try:
-            return _normalize(self._lib.read(symbol, date_range=date_range).data)
+            return _normalize(self._lib.read(symbol, date_range=date_range).data, tz)
         except Exception as exc:
             log.warning("read error %s: %s", symbol, exc)
             return pd.DataFrame()
@@ -169,15 +172,17 @@ class IncrCache:
         return t
 
     def _store(self, symbol: str, df: pd.DataFrame) -> None:
-        """Exclude the incomplete bar, localize to configured tz, then upsert."""
+        """Exclude the incomplete bar, then upsert.
+
+        Data must already be tz-aware in the configured timezone (via
+        ``_normalize``) before calling this method.
+        """
         tz = self._get_tz(symbol)
         threshold = self._incomplete_threshold(tz)
         if not df.empty and df.index[-1] >= threshold:
             df = df.iloc[:-1]
         if df.empty:
             return
-        if tz and isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
-            df = df.set_axis(df.index.tz_localize(tz))
         rows = len(df)
 
         def write():
@@ -201,8 +206,8 @@ class IncrCache:
         """Return the last *count* bars for *symbol* up to *end*.
 
         *end* is converted to the configured timezone (via ``get_tz``) before
-        querying ArcticDB.  The returned DataFrame is tz-naive, with
-        timestamps in the configured timezone's wall-clock time.
+        querying ArcticDB.  The returned DataFrame is tz-aware in the
+        configured timezone.
         """
         tz = self._get_tz(symbol)
         end_ts = self._resolve_end(end, tz)
@@ -214,41 +219,40 @@ class IncrCache:
         # for daily, 2x handles weekends and holidays.
         lookback = 2 if self.is_daily else 7
         start_ts = end_ts - pd.Timedelta(minutes=count * self.bar_minutes * lookback)
-        existing = self._read(symbol, (start_ts, end_ts))
-        end_naive = end_ts.tz_localize(None) if tz else end_ts
+        existing = self._read(symbol, (start_ts, end_ts), tz)
 
         def trim(df: pd.DataFrame) -> pd.DataFrame:
-            return _trim(df, end_naive, count)
+            return _trim(df, end_ts, count)
 
         def merge(*dfs: pd.DataFrame) -> pd.DataFrame:
-            return trim(_normalize(pd.concat(dfs)))
+            return trim(_normalize(pd.concat(dfs), tz))
 
         # Cache miss
         if existing.empty:
             log.info("miss %s, fetching %d bars", symbol, count)
-            df = _normalize(self._fetch(symbol, end_ts, count))
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if not df.empty:
                 self._store(symbol, df)
             return trim(df)
 
         # Fresh — but fall through if we have fewer rows than requested
         last = existing.index[-1]
-        if self._is_fresh(last, end_naive, tz):
+        if self._is_fresh(last, end_ts, tz):
             trimmed = trim(existing)
             if len(trimmed) >= count:
                 return trimmed
             # Not enough rows cached; fetch full count
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
-            df = _normalize(self._fetch(symbol, end_ts, count))
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if not df.empty:
                 self._store(symbol, df)
                 return merge(existing, df)
             return trimmed
 
         # Incremental update
-        gap = int((end_naive - last).total_seconds() / 60 / self.bar_minutes) + 1
-        log.info("update %s: %s -> %s", symbol, last.date(), end_naive.date())
-        new = _normalize(self._fetch(symbol, end_ts, gap))
+        gap = int((end_ts - last).total_seconds() / 60 / self.bar_minutes) + 1
+        log.info("update %s: %s -> %s", symbol, last.date(), end_ts.date())
+        new = _normalize(self._fetch(symbol, end_ts, gap), tz)
         if new.empty:
             return trim(existing)
 
