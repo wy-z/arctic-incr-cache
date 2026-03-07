@@ -30,7 +30,7 @@ def _upstream_minute_bars(ctx, n, start):
 def _lib_with_tz_bars(ctx, n, tz_name, start):
     tz = ZoneInfo(tz_name)
     raw = intraday_df(start, n)
-    raw.index = raw.index.tz_localize(tz)
+    raw.index = pd.DatetimeIndex(raw.index).tz_localize(tz)
     ctx["lib"].has_symbol.return_value = True
     ctx["lib"].read.return_value.data = raw
 
@@ -61,13 +61,14 @@ def _request_with_tz(ctx, count, symbol, end, tz_name):
 @then(parsers.parse('the stored data has timezone "{tz_name}"'))
 def _stored_has_tz(ctx, tz_name):
     stored = ctx["lib"].update.call_args[0][1]
-    assert stored.index.tz is not None
-    assert str(stored.index.tz) == tz_name
+    idx = pd.DatetimeIndex(stored.index)
+    assert idx.tz is not None
+    assert str(idx.tz) == tz_name
 
 
 @then("the result index is tz-naive")
 def _result_is_naive(ctx):
-    assert ctx["result"].index.tz is None
+    assert pd.DatetimeIndex(ctx["result"].index).tz is None
 
 
 @then("the result timestamps are in New York wall-clock time")

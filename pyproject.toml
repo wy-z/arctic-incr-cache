@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/nickchan2/arctic-incr-cache"
+Repository = "https://github.com/wy-z/arctic-incr-cache"
 
 [build-system]
 requires = ["hatchling"]

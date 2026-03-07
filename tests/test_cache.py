@@ -21,15 +21,21 @@ def _intraday_df(start, n):
     return pd.DataFrame({"price": range(n)}, index=times)
 
 
-def _make_cache(lib, fetch_data=None, **kwargs):
+def _make_cache(
+    lib,
+    fetch_data=None,
+    *,
+    bar_minutes: int = 1440,
+    default_count: int = 252,
+    get_tz=None,
+):
     """Build an IncrCache with a mock library and canned fetch data."""
     data = fetch_data if fetch_data is not None else pd.DataFrame()
     fetch = MagicMock(return_value=data)
-    defaults = {"bar_minutes": 1440, "default_count": 252}
-    defaults.update(kwargs)
-    cache = IncrCache(lib, fetch, **defaults)
-    cache._fetch_mock = fetch  # expose for assertions
-    return cache
+    return IncrCache(
+        lib, fetch,
+        bar_minutes=bar_minutes, default_count=default_count, get_tz=get_tz,
+    )
 
 
 # ── fixtures ─────────────────────────────────────────────────────
@@ -184,8 +190,8 @@ class TestTimezoneEndToEnd:
         cache.get("S", end=datetime.datetime(2024, 1, 15, 10, 30), count=30)
 
         stored = lib.update.call_args[0][1]
-        assert stored.index.tz is not None
-        assert str(stored.index.tz) == "America/New_York"
+        assert pd.DatetimeIndex(stored.index).tz is not None
+        assert str(pd.DatetimeIndex(stored.index).tz) == "America/New_York"
 
     def test_read_returns_naive_in_configured_tz(self, lib):
         from zoneinfo import ZoneInfo
@@ -193,7 +199,7 @@ class TestTimezoneEndToEnd:
         tz = ZoneInfo("America/New_York")
         # Simulate ArcticDB returning tz-aware data in NY
         raw = _intraday_df("2024-01-15 09:30", 60)
-        raw.index = raw.index.tz_localize(tz)
+        raw.index = pd.DatetimeIndex(raw.index).tz_localize(tz)
         lib.has_symbol.return_value = True
         lib.read.return_value.data = raw
 
@@ -204,7 +210,7 @@ class TestTimezoneEndToEnd:
             "S", end=datetime.datetime(2024, 1, 15, 10, 30), count=30
         )
 
-        assert result.index.tz is None
+        assert pd.DatetimeIndex(result.index).tz is None
         # Wall-clock time preserved (not UTC-converted: 09:30 NY != 14:30 UTC)
         assert result.index[0] < pd.Timestamp("2024-01-15 12:00:00")
 
@@ -217,9 +223,9 @@ class TestNormalize:
         from arctic_incr_cache.cache import _normalize
 
         df = _daily_df("2024-01-01", 5)
-        df.index = df.index.tz_localize("UTC")
+        df.index = pd.DatetimeIndex(df.index).tz_localize("UTC")
         result = _normalize(df)
-        assert result.index.tz is None
+        assert pd.DatetimeIndex(result.index).tz is None
 
     def test_deduplicates_keeping_last(self):
         from arctic_incr_cache.cache import _normalize
