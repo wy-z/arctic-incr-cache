@@ -37,8 +37,11 @@ def _make_cache(
     data = fetch_data if fetch_data is not None else pd.DataFrame()
     fetch = MagicMock(return_value=data)
     return IncrCache(
-        lib, fetch,
-        get_tz=get_tz, bar_minutes=bar_minutes, default_count=default_count,
+        lib,
+        fetch,
+        get_tz=get_tz,
+        bar_minutes=bar_minutes,
+        default_count=default_count,
     )
 
 
@@ -95,6 +98,20 @@ class TestCacheHit:
         result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
 
         assert len(result) == 10
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+
+    def test_short_floor_suppresses_refetch(self, lib):
+        """When source has no more data, record oldest date and skip re-fetch."""
+        lib.has_symbol.return_value = True
+        # Cache has 5 rows — source also only has 5 rows (can't fill to 10)
+        cached = _daily_df("2024-01-11", 5)
+        lib.read.return_value.data = cached
+
+        cache = _make_cache(lib, cached)  # fetch returns same data
+        cache.get("S", end=datetime.date(2024, 1, 15), count=10)
+        cache.get("S", end=datetime.date(2024, 1, 15), count=10)
+
+        # Should only fetch once — second call sees floor covers existing
         cache._fetch.assert_called_once()  # type: ignore[union-attr]
 
 
@@ -160,13 +177,14 @@ class TestIncrementalUpdate:
 
 class TestIncompleteBarExclusion:
     def test_today_excluded_from_daily_storage(self, lib):
-        today = datetime.date.today()
-        df = _daily_df(today - datetime.timedelta(days=14), 15)
+        today_utc = pd.Timestamp.now(_UTC).normalize()
+        start = (today_utc - pd.Timedelta(days=14)).date()
+        df = _daily_df(start, 15)
         cache = _make_cache(lib, df)
         cache.get("S", count=10)
 
         stored = lib.update.call_args[0][1]
-        assert stored.index[-1] < pd.Timestamp.now(_UTC).normalize()
+        assert stored.index[-1] < today_utc
 
 
 # ── intraday ─────────────────────────────────────────────────────
@@ -332,7 +350,7 @@ class TestResolveEnd:
     def test_none_defaults_to_now(self):
         cache = _make_cache(MagicMock())
         result = cache._resolve_end(None, tz=_UTC)
-        assert result.date() == datetime.date.today()
+        assert result.date() == pd.Timestamp.now(_UTC).date()
 
 
 # ── write locking ────────────────────────────────────────────────

@@ -1,6 +1,5 @@
 """Incomplete bar exclusion scenario + today-specific steps."""
 
-import datetime
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -18,8 +17,9 @@ scenarios("incomplete_bar.feature")
 
 @given("an upstream source with 15 daily bars ending today")
 def _upstream_ending_today(ctx):
-    today = datetime.date.today()
-    ctx["fetch_data"] = daily_df(today - datetime.timedelta(days=14), 15)
+    today_utc = pd.Timestamp.now(_UTC).normalize()
+    start = (today_utc - pd.Timedelta(days=14)).date()
+    ctx["fetch_data"] = daily_df(start, 15)
 
 
 @when('I request 10 bars for "S" with no end date')

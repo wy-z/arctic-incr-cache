@@ -16,6 +16,7 @@ Every symbol has a configured timezone via ``get_tz(symbol) -> tzinfo``.
 import datetime
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -79,6 +80,8 @@ class IncrCache:
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
     """
 
+    FLOOR_TTL = 3600  # seconds
+
     def __init__(
         self,
         library: Any,
@@ -101,6 +104,9 @@ class IncrCache:
         self._lock_class = lock_class or threading.Lock
         self._locks: dict[str, Any] = {}
         self._meta_lock = threading.Lock()
+        # Per-symbol (oldest_ts, expiry): skip re-fetch when cache
+        # already covers the source's oldest available date.
+        self._floor: dict[str, tuple[pd.Timestamp, float]] = {}
 
     @property
     def is_daily(self) -> bool:
@@ -241,13 +247,23 @@ class IncrCache:
             trimmed = trim(existing)
             if len(trimmed) >= count:
                 return trimmed
-            # Not enough rows cached; fetch full count
+            # Source's oldest known date still valid and cache covers it?
+            now = time.monotonic()
+            floor = self._floor.get(symbol)
+            if floor:
+                oldest, expiry = floor
+                if now < expiry and existing.index[0] <= oldest:
+                    log.info("floor hit %s: oldest=%s", symbol, oldest)
+                    return trimmed
+
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
-            if not df.empty:
-                self._store(symbol, df)
-                return merge(existing, df)
-            return trimmed
+            if df.empty:
+                return trimmed
+            self._store(symbol, df)
+            if len(df) < count:
+                self._floor[symbol] = (df.index[0], now + self.FLOOR_TTL)
+            return merge(existing, df)
 
         # Incremental update
         gap = int((end_ts - last).total_seconds() / 60 / self.bar_minutes) + 1
