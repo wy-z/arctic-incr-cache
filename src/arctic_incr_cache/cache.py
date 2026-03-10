@@ -204,7 +204,7 @@ class IncrCache:
         def write():
             try:
                 with self._lock_for(symbol):
-                    self._lib.update(symbol, df, upsert=True)
+                    self._lib.update(symbol, df, upsert=True, prune_previous_versions=True)
                 log.info("stored %s (+%d rows)", symbol, rows)
             except Exception:
                 log.exception("write error %s", symbol)
