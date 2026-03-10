@@ -282,7 +282,6 @@ class IncrCache:
                 return trim(existing)
             self._store(symbol, df)
             return trim(df)
-        log.info("update %s: %s -> %s", symbol, last.date(), end_ts.date())
         new = _normalize(self._fetch(symbol, end_ts, gap), tz)
         if new.empty:
             return trim(existing)
@@ -293,5 +292,6 @@ class IncrCache:
         if new.empty:
             return trim(existing)
 
+        log.info("update %s: %s -> %s", symbol, last.date(), end_ts.date())
         self._store(symbol, new)
         return merge(existing, new)
