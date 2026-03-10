@@ -200,6 +200,22 @@ class TestIntraday:
         assert len(result) == 100
         lib.update.assert_called_once()
 
+    def test_large_gap_falls_back_to_miss(self, lib):
+        """When gap between cached and requested end exceeds count, refetch instead of filling."""
+        cached = _intraday_df("2024-01-12 09:30", 150)
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = cached
+
+        fresh = _intraday_df("2024-01-15 09:30", 360)
+        cache = _make_cache(lib, fresh, bar_minutes=1, default_count=1950)
+        end = datetime.datetime(2024, 1, 15, 15, 30, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=360)
+
+        assert len(result) == 360
+        fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
+        _, _, call_count = fetch_mock.call_args[0]
+        assert call_count == 360
+
     def test_gap_count_uses_minute_resolution(self, lib):
         cached = _intraday_df("2024-01-15 09:30", 150)
         lib.has_symbol.return_value = True

@@ -265,8 +265,15 @@ class IncrCache:
                 self._floor[symbol] = (df.index[0], now + self.FLOOR_TTL)
             return merge(existing, df)
 
-        # Incremental update
+        # Incremental update — if gap exceeds requested count, treat as miss
         gap = int((end_ts - last).total_seconds() / 60 / self.bar_minutes) + 1
+        if gap > count:
+            log.info("gap too large %s: %d > %d, refetching", symbol, gap, count)
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
+            if df.empty:
+                return trim(existing)
+            self._store(symbol, df)
+            return trim(df)
         log.info("update %s: %s -> %s", symbol, last.date(), end_ts.date())
         new = _normalize(self._fetch(symbol, end_ts, gap), tz)
         if new.empty:
