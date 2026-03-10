@@ -1,6 +1,6 @@
 [project]
 name = "arctic-incr-cache"
-version = "0.1.6"
+version = "0.1.7"
 description = "ArcticDB-backed time series cache with incremental updates — fetch once, upsert the gap."
 readme = "README.md"
 requires-python = ">=3.12"
