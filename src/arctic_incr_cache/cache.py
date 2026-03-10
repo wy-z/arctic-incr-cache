@@ -77,6 +77,10 @@ class IncrCache:
         default_count: Bars returned when *count* is omitted.
         spawn: Fire-and-forget callable for async writes.
             Defaults to daemon threads.  Pass ``gevent.spawn`` for async runtimes.
+        lookback: Read-window multiplier (default 2).
+            ``count * bar_minutes * lookback`` determines how far back to
+            read from storage.  Use 1 for range-based queries where the
+            count already matches the calendar span (e.g., intraday).
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
     """
 
@@ -91,6 +95,7 @@ class IncrCache:
         bar_minutes: int = 1440,
         default_count: int = 252,
         spawn: Callable[..., Any] | None = None,
+        lookback: int = 2,
         lock_class: type | None = None,
     ):
         if bar_minutes <= 0:
@@ -101,6 +106,7 @@ class IncrCache:
         self.bar_minutes = bar_minutes
         self.default_count = default_count
         self._spawn = spawn
+        self.lookback = lookback
         self._lock_class = lock_class or threading.Lock
         self._locks: dict[str, Any] = {}
         self._meta_lock = threading.Lock()
@@ -225,9 +231,7 @@ class IncrCache:
             count = self.default_count
         if count <= 0:
             return pd.DataFrame()
-        # For intraday, account for overnight gaps and weekends (≈7x);
-        # for daily, 2x handles weekends and holidays.
-        lookback = 2 if self.is_daily else 7
+        lookback = self.lookback
         start_ts = end_ts - pd.Timedelta(minutes=count * self.bar_minutes * lookback)
         existing = self._read(symbol, (start_ts, end_ts), tz)
 
