@@ -147,7 +147,7 @@ class IncrCache:
             return pd.Timestamp.now(tz).normalize()
         return pd.Timestamp.now(tz) - pd.Timedelta(minutes=self.bar_minutes)
 
-    def _is_fresh(
+    def is_fresh(
         self, last: pd.Timestamp, end: pd.Timestamp, tz: datetime.tzinfo
     ) -> bool:
         threshold = self._incomplete_threshold(tz)
@@ -204,7 +204,7 @@ class IncrCache:
         def write():
             try:
                 with self._lock_for(symbol):
-                    self._lib.update(symbol, df, upsert=True)
+                    self._lib.update(symbol, df, upsert=True, prune_previous_versions=True)
                 log.info("stored %s (+%d rows)", symbol, rows)
             except Exception:
                 log.exception("write error %s", symbol)
@@ -251,7 +251,7 @@ class IncrCache:
 
         # Fresh — but fall through if we have fewer rows than requested
         last = existing.index[-1]
-        if self._is_fresh(last, end_ts, tz):
+        if self.is_fresh(last, end_ts, tz):
             trimmed = trim(existing)
             if len(trimmed) >= count:
                 return trimmed
