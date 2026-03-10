@@ -151,7 +151,11 @@ class IncrCache:
             else datetime.timedelta(minutes=self.bar_minutes)
         )
         safe = last - backoff if last >= threshold else last
-        return safe.date() >= end.date() if self.is_daily else safe >= end
+        if self.is_daily:
+            return safe.date() >= end.date()
+        # Freshness is left-closed right-open: the bar at end may not exist yet.
+        expected_last = end - backoff
+        return safe >= expected_last
 
     # ── storage ───────────────────────────────────────────────────
 

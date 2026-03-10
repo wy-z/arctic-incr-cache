@@ -82,6 +82,11 @@ When `get_tz` returns a timezone for a symbol:
 - **Return** — `get()` returns a tz-aware DataFrame in the configured timezone.
 - **`end` parameter** — `date` becomes end-of-day in market timezone; naive `datetime` is interpreted as **local timezone**, then converted; tz-aware is converted directly.
 
+## Interval convention
+
+- **Data & return** — both ends inclusive (`index <= end`). The returned DataFrame includes the bar at `end` if it exists.
+- **Freshness check** — left-closed right-open. The cache considers data fresh when the last cached bar reaches `end - bar_width`, since the bar at `end` itself may not yet exist.
+
 ## Constructor parameters
 
 | Parameter | Required | Description |
