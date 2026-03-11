@@ -87,6 +87,14 @@ When `get_tz` returns a timezone for a symbol:
 - **Data & return** — both ends inclusive (`index <= end`). The returned DataFrame includes the bar at `end` if it exists.
 - **Freshness check** — left-closed right-open. The cache considers data fresh when the last cached bar reaches `end - bar_width`, since the bar at `end` itself may not yet exist.
 
+## Index convention
+
+`fetch()` must return a DataFrame with a **`DatetimeIndex`** as the index — this is
+the time axis for all cache operations (querying, merging, freshness checks).
+ArcticDB's `date_range` queries operate on the index, so no column name
+configuration is needed. If your data source returns time as a regular column,
+call `df.set_index("date")` (or similar) inside your `fetch` function.
+
 ## Constructor parameters
 
 | Parameter | Required | Description |
