@@ -200,12 +200,13 @@ class IncrCache:
         if df.empty:
             return
         rows = len(df)
+        span = f"{df.index[0].date()}..{df.index[-1].date()}"
 
         def write():
             try:
                 with self._lock_for(symbol):
                     self._lib.update(symbol, df, upsert=True, prune_previous_versions=True)
-                log.info("stored %s (+%d rows)", symbol, rows)
+                log.info("stored %s %s (+%d rows)", symbol, span, rows)
             except Exception:
                 log.exception("write error %s", symbol)
 
@@ -292,6 +293,5 @@ class IncrCache:
         if new.empty:
             return trim(existing)
 
-        log.info("update %s: %s -> %s", symbol, last.date(), end_ts.date())
         self._store(symbol, new)
         return merge(existing, new)
