@@ -82,6 +82,8 @@ class IncrCache:
             read from storage.  Use 1 for range-based queries where the
             count already matches the calendar span (e.g., intraday).
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
+        floor: Shared floor dict for cross-instance state.
+            Maps symbol to ``(oldest_ts, expiry)``.  Defaults to a new dict.
     """
 
     FLOOR_TTL = 3600  # seconds
@@ -97,6 +99,7 @@ class IncrCache:
         spawn: Callable[..., Any] | None = None,
         lookback: int = 2,
         lock_class: type | None = None,
+        floor: dict[str, tuple[pd.Timestamp, float]] | None = None,
     ):
         if bar_minutes <= 0:
             raise ValueError("bar_minutes must be > 0")
@@ -112,7 +115,7 @@ class IncrCache:
         self._meta_lock = threading.Lock()
         # Per-symbol (oldest_ts, expiry): skip re-fetch when cache
         # already covers the source's oldest available date.
-        self._floor: dict[str, tuple[pd.Timestamp, float]] = {}
+        self._floor = floor if floor is not None else {}
 
     @property
     def is_daily(self) -> bool:
@@ -268,6 +271,8 @@ class IncrCache:
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if df.empty:
+                # Source has no more data — set floor to avoid re-fetching.
+                self._floor[symbol] = (existing.index[0], now + self.FLOOR_TTL)
                 return trimmed
             self._store(symbol, df)
             if len(df) < count:
