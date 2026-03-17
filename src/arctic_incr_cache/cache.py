@@ -15,12 +15,14 @@ Every symbol has a configured timezone via ``get_tz(symbol) -> tzinfo``.
 
 import datetime
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
+import ring
 
 log = logging.getLogger(__name__)
 
@@ -78,15 +80,19 @@ class IncrCache:
         spawn: Fire-and-forget callable for async writes.
             Defaults to daemon threads.  Pass ``gevent.spawn`` for async runtimes.
         lookback: Read-window multiplier (default 2).
-            ``count * bar_minutes * lookback`` determines how far back to
-            read from storage.  Use 1 for range-based queries where the
-            count already matches the calendar span (e.g., intraday).
+            Daily: ``count * lookback`` calendar days.
+            Intraday: ``ceil(count * bar_minutes / 1440) * lookback``
+            calendar days, with a 7-day minimum to span weekends.
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
         floor: Shared floor dict for cross-instance state.
             Maps symbol to ``(oldest_ts, expiry)``.  Defaults to a new dict.
+        cache_ttl: Result TTL in seconds (default 60).
+            Repeated ``get()`` calls with the same resolved parameters
+            return a cached result within this window.  Set to 0 to disable.
     """
 
     FLOOR_TTL = 3600  # seconds
+    MIN_LOOKBACK_DAYS = 7  # cover weekends / short holidays
 
     def __init__(
         self,
@@ -100,6 +106,7 @@ class IncrCache:
         lookback: int = 2,
         lock_class: type | None = None,
         floor: dict[str, tuple[pd.Timestamp, float]] | None = None,
+        cache_ttl: int = 60,
     ):
         if bar_minutes <= 0:
             raise ValueError("bar_minutes must be > 0")
@@ -116,6 +123,12 @@ class IncrCache:
         # Per-symbol (oldest_ts, expiry): skip re-fetch when cache
         # already covers the source's oldest available date.
         self._floor = floor if floor is not None else {}
+        get_impl: Callable[[str, pd.Timestamp, int], pd.DataFrame]
+        if cache_ttl > 0:
+            get_impl = ring.lru(expire=cache_ttl)(self._do_get)  # type: ignore[assignment]
+        else:
+            get_impl = self._do_get
+        self._cached_get = get_impl
 
     @property
     def is_daily(self) -> bool:
@@ -144,6 +157,12 @@ class IncrCache:
             return ts.tz_convert(tz)
         return pd.Timestamp(ts.to_pydatetime().astimezone()).tz_convert(tz)
 
+    def _align_bar(self, ts: pd.Timestamp) -> pd.Timestamp:
+        """Floor *ts* to the bar boundary."""
+        if self.is_daily:
+            return ts.normalize()
+        return ts.floor(f"{self.bar_minutes}min")
+
     def _incomplete_threshold(self, tz: datetime.tzinfo) -> pd.Timestamp:
         """Bars at or after this tz-aware timestamp may still be updating."""
         if self.is_daily:
@@ -162,7 +181,6 @@ class IncrCache:
         safe = last - backoff if last >= threshold else last
         if self.is_daily:
             return safe.date() >= end.date()
-        # Freshness is left-closed right-open: the bar at end may not exist yet.
         expected_last = end - backoff
         return safe >= expected_last
 
@@ -230,13 +248,23 @@ class IncrCache:
         configured timezone.
         """
         tz = self._get_tz(symbol)
-        end_ts = self._resolve_end(end, tz)
+        end_ts = self._align_bar(self._resolve_end(end, tz))
         if count is None:
             count = self.default_count
         if count <= 0:
             return pd.DataFrame()
-        lookback = self.lookback
-        start_ts = end_ts - pd.Timedelta(minutes=count * self.bar_minutes * lookback)
+        result = self._cached_get(symbol, end_ts, count)
+        return result.copy() if self._cached_get is not self._do_get else result
+
+    def _do_get(
+        self, symbol: str, end_ts: pd.Timestamp, count: int
+    ) -> pd.DataFrame:
+        tz = self._get_tz(symbol)
+        if self.is_daily:
+            start_ts = end_ts - pd.Timedelta(days=count * self.lookback)
+        else:
+            cal_days = math.ceil(count * self.bar_minutes / 1440) * self.lookback
+            start_ts = end_ts - pd.Timedelta(days=max(cal_days, self.MIN_LOOKBACK_DAYS))
         existing = self._read(symbol, (start_ts, end_ts), tz)
 
         def trim(df: pd.DataFrame) -> pd.DataFrame:
@@ -271,7 +299,6 @@ class IncrCache:
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if df.empty:
-                # Source has no more data — set floor to avoid re-fetching.
                 self._floor[symbol] = (existing.index[0], now + self.FLOOR_TTL)
                 return trimmed
             self._store(symbol, df)
@@ -279,16 +306,8 @@ class IncrCache:
                 self._floor[symbol] = (df.index[0], now + self.FLOOR_TTL)
             return merge(existing, df)
 
-        # Incremental update — if gap exceeds requested count, treat as miss
-        gap = int((end_ts - last).total_seconds() / 60 / self.bar_minutes) + 1
-        if gap > count:
-            log.info("gap too large %s: %d > %d, refetching", symbol, gap, count)
-            df = _normalize(self._fetch(symbol, end_ts, count), tz)
-            if df.empty:
-                return trim(existing)
-            self._store(symbol, df)
-            return trim(df)
-        new = _normalize(self._fetch(symbol, end_ts, gap), tz)
+        # Incremental update — fetch count bars and merge
+        new = _normalize(self._fetch(symbol, end_ts, count), tz)
         if new.empty:
             return trim(existing)
 

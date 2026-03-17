@@ -1,7 +1,7 @@
 """Tests for IncrCache."""
 
 import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -42,6 +42,7 @@ def _make_cache(
         get_tz=get_tz,
         bar_minutes=bar_minutes,
         default_count=default_count,
+        cache_ttl=0,
     )
 
 
@@ -227,6 +228,38 @@ class TestIntraday:
         result = cache.get("S", end=end, count=500)
 
         assert not result.empty
+
+    def test_end_none_floors_to_bar_boundary_for_freshness(self, lib):
+        lib.has_symbol.return_value = True
+        cached = pd.DataFrame(
+            {"price": [1]},
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-15 10:30", tz=_UTC)]),
+        )
+        lib.read.return_value.data = cached
+
+        cache = _make_cache(lib, bar_minutes=1, default_count=390)
+        now = pd.Timestamp("2024-01-15 10:31:05", tz=_UTC)
+
+        def _now(tz=None):
+            return now.tz_convert(tz) if tz else now.tz_localize(None)
+
+        with patch("arctic_incr_cache.cache.pd.Timestamp.now", side_effect=_now):
+            result = cache.get("S", end=None, count=1)
+
+        assert len(result) == 1
+        cache._fetch.assert_not_called()  # type: ignore[union-attr]
+
+    def test_intraday_read_window_uses_calendar_days(self, lib):
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = pd.DataFrame()
+
+        cache = _make_cache(lib, bar_minutes=1, default_count=390)
+        end = datetime.datetime(2024, 1, 15, 9, 30, tzinfo=_UTC)
+        cache.get("S", end=end, count=390)
+
+        start_ts, end_ts = lib.read.call_args.kwargs["date_range"]
+        assert end_ts == pd.Timestamp(end)
+        assert start_ts <= pd.Timestamp("2024-01-11 09:30", tz=_UTC)
 
 
 # ── timezone end-to-end ───────────────────────────────────────────

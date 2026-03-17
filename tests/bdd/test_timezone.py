@@ -48,7 +48,7 @@ def _request_with_tz(ctx, count, symbol, end, tz_name):
     fetch = MagicMock(return_value=ctx.get("fetch_data", pd.DataFrame()))
     cache = IncrCache(
         ctx["lib"], fetch, bar_minutes=1, default_count=1950,
-        get_tz=lambda _, t=tz: t,
+        get_tz=lambda _, t=tz: t, cache_ttl=0,
     )
     end_dt = datetime.datetime.fromisoformat(end).replace(tzinfo=tz)
     ctx["result"] = cache.get(symbol, end=end_dt, count=count)

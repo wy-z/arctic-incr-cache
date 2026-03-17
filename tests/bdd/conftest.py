@@ -70,7 +70,8 @@ def _request_bars(ctx, count, symbol, end):
     fetch = MagicMock(return_value=ctx.get("fetch_data", pd.DataFrame()))
     ctx["fetch"] = fetch
     cache = IncrCache(
-        ctx["lib"], fetch, get_tz=lambda _: _UTC, bar_minutes=1440, default_count=252
+        ctx["lib"], fetch, get_tz=lambda _: _UTC, bar_minutes=1440, default_count=252,
+        cache_ttl=0,
     )
     ctx["result"] = cache.get(
         symbol, end=datetime.date.fromisoformat(end), count=count
