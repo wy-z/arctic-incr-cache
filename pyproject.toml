@@ -1,6 +1,6 @@
 [project]
 name = "arctic-incr-cache"
-version = "0.1.12"
+version = "0.1.13"
 description = "ArcticDB-backed time series cache with incremental updates — fetch once, upsert the gap."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,6 +9,7 @@ keywords = ["arcticdb", "cache", "time-series", "incremental", "pandas"]
 dependencies = [
     "arcticdb>=6.5.0",
     "pandas>=2.0.0",
+    "ring>=0.7.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -41,6 +42,7 @@ dev = [
     "pyright>=1.1.407",
     "pandas-stubs>=2.3.3.251219",
     "pytest-bdd>=8.1.0",
+    "twine>=6.2.0",
 ]
 
 [tool.pytest.ini_options]
