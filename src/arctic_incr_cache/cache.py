@@ -85,13 +85,13 @@ class IncrCache:
             calendar days, with a 7-day minimum to span weekends.
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
         floor: Shared floor dict for cross-instance state.
-            Maps symbol to ``(oldest_ts, expiry)``.  Defaults to a new dict.
+            Maps symbol to ``(oldest_ts, expiry, hits)``.
         cache_ttl: Result TTL in seconds (default 60).
             Repeated ``get()`` calls with the same resolved parameters
             return a cached result within this window.  Set to 0 to disable.
     """
 
-    FLOOR_TTL = 3600  # seconds
+    FLOOR_TTLS = (360, 720, 1440)  # 6min, 12min, 24min progressive
     MIN_LOOKBACK_DAYS = 7  # cover weekends / short holidays
 
     def __init__(
@@ -105,7 +105,7 @@ class IncrCache:
         spawn: Callable[..., Any] | None = None,
         lookback: int = 2,
         lock_class: type | None = None,
-        floor: dict[str, tuple[pd.Timestamp, float]] | None = None,
+        floor: dict[str, tuple[pd.Timestamp, float, int]] | None = None,
         cache_ttl: int = 60,
     ):
         if bar_minutes <= 0:
@@ -120,7 +120,7 @@ class IncrCache:
         self._lock_class = lock_class or threading.Lock
         self._locks: dict[str, Any] = {}
         self._meta_lock = threading.Lock()
-        # Per-symbol (oldest_ts, expiry): skip re-fetch when cache
+        # Per-symbol (oldest_ts, expiry, hits): skip re-fetch when cache
         # already covers the source's oldest available date.
         self._floor = floor if floor is not None else {}
         get_impl: Callable[[str, pd.Timestamp, int], pd.DataFrame]
@@ -183,6 +183,18 @@ class IncrCache:
             return safe.date() >= end.date()
         expected_last = end - backoff
         return safe >= expected_last
+
+    # ── floor ─────────────────────────────────────────────────────
+
+    def _set_floor(self, symbol: str, oldest: pd.Timestamp) -> None:
+        prev = self._floor.get(symbol)
+        hits = (prev[2] if prev else 0) + 1
+        expiry = (
+            math.inf
+            if hits > len(self.FLOOR_TTLS)
+            else time.time() + self.FLOOR_TTLS[hits - 1]
+        )
+        self._floor[symbol] = (oldest, expiry, hits)
 
     # ── storage ───────────────────────────────────────────────────
 
@@ -288,22 +300,25 @@ class IncrCache:
             if len(trimmed) >= count:
                 return trimmed
             # Source's oldest known date still valid and cache covers it?
-            now = time.monotonic()
-            floor = self._floor.get(symbol)
-            if floor:
-                oldest, expiry = floor
-                if now < expiry and existing.index[0] <= oldest:
-                    log.info("floor hit %s: oldest=%s", symbol, oldest)
+            floor_entry = self._floor.get(symbol)
+            if floor_entry:
+                oldest, expiry, hits = floor_entry
+                if time.time() < expiry and existing.index[0] <= oldest:
+                    if hits <= len(self.FLOOR_TTLS):
+                        log.info(
+                            "floor hit %s: oldest=%s (hits=%d)",
+                            symbol, oldest, hits,
+                        )
                     return trimmed
 
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if df.empty:
-                self._floor[symbol] = (existing.index[0], now + self.FLOOR_TTL)
+                self._set_floor(symbol, existing.index[0])
                 return trimmed
             self._store(symbol, df)
             if len(df) < count:
-                self._floor[symbol] = (df.index[0], now + self.FLOOR_TTL)
+                self._set_floor(symbol, df.index[0])
             return merge(existing, df)
 
         # Incremental update — fetch count bars and merge
