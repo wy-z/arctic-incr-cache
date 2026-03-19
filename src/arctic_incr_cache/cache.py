@@ -184,6 +184,22 @@ class IncrCache:
         expected_last = end - backoff
         return safe >= expected_last
 
+    def _calc_stale_fetch_count(
+        self, last: pd.Timestamp, end: pd.Timestamp, count: int
+    ) -> int:
+        """Return bars to fetch for stale updates.
+
+        Fetch the gap plus one overlap bar so callers can refresh the cached tail.
+        If the gap exceeds the requested window, fall back to a full-window fetch.
+        """
+        if self.is_daily:
+            gap_count = (end.date() - last.date()).days + 1
+        else:
+            bar = pd.Timedelta(minutes=self.bar_minutes)
+            gap_count = math.floor((end - last) / bar) + 1
+        gap_count = max(gap_count, 1)
+        return min(gap_count, count)
+
     # ── floor ─────────────────────────────────────────────────────
 
     def _set_floor(self, symbol: str, oldest: pd.Timestamp) -> None:
@@ -321,8 +337,9 @@ class IncrCache:
                 self._set_floor(symbol, df.index[0])
             return merge(existing, df)
 
-        # Incremental update — fetch count bars and merge
-        new = _normalize(self._fetch(symbol, end_ts, count), tz)
+        # Incremental update — fetch only the stale gap (plus overlap) and merge
+        fetch_count = self._calc_stale_fetch_count(last, end_ts, count)
+        new = _normalize(self._fetch(symbol, end_ts, fetch_count), tz)
         if new.empty:
             return trim(existing)
 
