@@ -131,6 +131,9 @@ class TestIncrementalUpdate:
 
         assert len(result) == 15
         lib.update.assert_called_once()
+        fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
+        _, _, call_count = fetch_mock.call_args[0]
+        assert call_count == 11
 
     def test_deduplicates_unchanged_overlap(self, lib):
         cached = _daily_df("2024-01-01", 10)
@@ -160,6 +163,23 @@ class TestIncrementalUpdate:
 
         stored = lib.update.call_args[0][1]
         assert pd.Timestamp("2024-01-10", tz=_UTC) in stored.index
+
+    def test_daily_gap_across_dst_spring_forward(self, lib):
+        """Gap calculation uses calendar days, not timedelta, to avoid DST errors."""
+        # 2024-03-10 is US spring forward — midnight-to-midnight is only 23h
+        dates = pd.date_range("2024-03-05", periods=5, freq="D", tz=_NY)
+        cached = pd.DataFrame({"value": range(5)}, index=dates)  # ends Mar 9
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = cached
+
+        new_dates = pd.date_range("2024-03-10", periods=3, freq="D", tz=_NY)
+        new = pd.DataFrame({"value": range(200, 203)}, index=new_dates)
+        cache = _make_cache(lib, new, get_tz=lambda _: _NY)
+        cache.get("S", end=datetime.date(2024, 3, 12), count=10)
+
+        fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
+        _, _, call_count = fetch_mock.call_args[0]
+        assert call_count == 4  # Mar 9 (overlap) + Mar 10, 11, 12
 
     def test_empty_source_returns_existing(self, lib):
         cached = _daily_df("2024-01-01", 10)
@@ -228,6 +248,9 @@ class TestIntraday:
         result = cache.get("S", end=end, count=500)
 
         assert not result.empty
+        fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
+        _, _, call_count = fetch_mock.call_args[0]
+        assert call_count == 212
 
     def test_end_none_floors_to_bar_boundary_for_freshness(self, lib):
         lib.has_symbol.return_value = True
