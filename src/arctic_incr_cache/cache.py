@@ -89,6 +89,10 @@ class IncrCache:
         cache_ttl: Result TTL in seconds (default 60).
             Repeated ``get()`` calls with the same resolved parameters
             return a cached result within this window.  Set to 0 to disable.
+        min_bars_per_day: Minimum expected complete bars per trading day
+            (intraday only).  Cached dates with fewer bars are treated as
+            corrupt and re-fetched.  Defaults to ``max(1, 60 // bar_minutes)``
+            (≈ 1 hour of bars).  Ignored for daily bars.
     """
 
     FLOOR_TTLS = (360, 720, 1440)  # 6min, 12min, 24min progressive
@@ -107,6 +111,7 @@ class IncrCache:
         lock_class: type | None = None,
         floor: dict[str, tuple[pd.Timestamp, float, int]] | None = None,
         cache_ttl: int = 60,
+        min_bars_per_day: int | None = None,
     ):
         if bar_minutes <= 0:
             raise ValueError("bar_minutes must be > 0")
@@ -114,6 +119,12 @@ class IncrCache:
         self._fetch = fetch
         self._get_tz = get_tz
         self.bar_minutes = bar_minutes
+        if bar_minutes >= 1440:
+            self.min_bars_per_day = 0
+        elif min_bars_per_day is not None:
+            self.min_bars_per_day = min_bars_per_day
+        else:
+            self.min_bars_per_day = max(1, 60 // bar_minutes)
         self.default_count = default_count
         self._spawn = spawn
         self.lookback = lookback
@@ -212,6 +223,15 @@ class IncrCache:
         )
         self._floor[symbol] = (oldest, expiry, hits)
 
+    # ── density validation ─────────────────────────────────────────
+
+    def _is_sparse(self, df: pd.DataFrame, target_date: datetime.date) -> bool:
+        """Return True if *df* has suspiciously few bars on *target_date*."""
+        if self.min_bars_per_day <= 0 or df.empty:
+            return False
+        n = int((pd.DatetimeIndex(df.index).date == target_date).sum())
+        return 0 < n < self.min_bars_per_day
+
     # ── storage ───────────────────────────────────────────────────
 
     def _lock_for(self, symbol: str) -> Any:
@@ -309,8 +329,26 @@ class IncrCache:
                 self._store(symbol, df)
             return trim(df)
 
-        # Fresh — but fall through if we have fewer rows than requested
+        # Sparse — target date has too few bars, full re-fetch
+        # Skip for today: the trading day is still in progress.
         last = existing.index[-1]
+        target = end_ts.date()
+        if (
+            count >= self.min_bars_per_day
+            and target < pd.Timestamp.now(tz).date()
+            and self._is_sparse(existing, target)
+        ):
+            log.warning(
+                "sparse %s on %s (need >=%d bars), refetching",
+                symbol, target, self.min_bars_per_day,
+            )
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
+            if df.empty or self._is_sparse(df, target):
+                return trim(existing)
+            self._store(symbol, df)
+            return merge(existing, df)
+
+        # Fresh — but fall through if we have fewer rows than requested
         if self.is_fresh(last, end_ts, tz):
             trimmed = trim(existing)
             if len(trimmed) >= count:
