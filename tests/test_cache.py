@@ -32,6 +32,7 @@ def _make_cache(
     bar_minutes: int = 1440,
     default_count: int = 252,
     get_tz=lambda _: _UTC,
+    min_bars_per_day: int | None = None,
 ):
     """Build an IncrCache with a mock library and canned fetch data."""
     data = fetch_data if fetch_data is not None else pd.DataFrame()
@@ -43,6 +44,7 @@ def _make_cache(
         bar_minutes=bar_minutes,
         default_count=default_count,
         cache_ttl=0,
+        min_bars_per_day=min_bars_per_day,
     )
 
 
@@ -440,3 +442,131 @@ class TestWriteLock:
         a = cache._lock_for("A")
         b = cache._lock_for("B")
         assert a is not b
+
+
+# ── sparse density validation ────────────────────────────────────
+
+
+class TestSparseDensity:
+    """Sparse density validation: detect and recover from garbage cached data."""
+
+    def test_sparse_cache_triggers_refetch(self, lib):
+        """1 garbage bar on target date → re-fetch full window."""
+        garbage = _intraday_df("2024-10-17 19:59", 1)
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = pd.concat([
+            _intraday_df("2024-10-16 09:30", 200), garbage,
+        ])
+
+        full = _intraday_df("2024-10-17 09:30", 390)
+        cache = _make_cache(
+            lib, full, bar_minutes=1, default_count=200, min_bars_per_day=60,
+        )
+        end = datetime.datetime(2024, 10, 17, 20, 0, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=200)
+
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+        on_day = pd.DatetimeIndex(result.index).date == datetime.date(2024, 10, 17)
+        assert on_day.sum() > 1
+
+    def test_sparse_upstream_returns_existing(self, lib):
+        """Re-fetch also sparse → return existing, don't store."""
+        garbage = _intraday_df("2024-10-17 19:59", 1)
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = pd.concat([
+            _intraday_df("2024-10-16 09:30", 200), garbage,
+        ])
+
+        cache = _make_cache(
+            lib, garbage, bar_minutes=1, default_count=200, min_bars_per_day=60,
+        )
+        end = datetime.datetime(2024, 10, 17, 20, 0, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=200)
+
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+        assert len(result) == 200
+        lib.update.assert_not_called()
+
+    def test_stale_sparse_triggers_full_refetch(self, lib):
+        """Only 1 garbage bar in cache → full re-fetch, not gap fetch."""
+        garbage = _intraday_df("2024-10-17 19:59", 1)
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = garbage
+
+        full = _intraday_df("2024-10-17 09:30", 390)
+        cache = _make_cache(
+            lib, full, bar_minutes=1, default_count=390, min_bars_per_day=60,
+        )
+        end = datetime.datetime(2024, 10, 17, 23, 59, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=390)
+
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+        _, _, call_count = cache._fetch.call_args[0]  # type: ignore[union-attr]
+        assert call_count == 390  # full window, not gap
+        assert len(result) > 1
+
+    def test_stale_sparse_upstream_also_bad(self, lib):
+        """Sparse cache + sparse upstream → return existing."""
+        garbage = _intraday_df("2024-10-17 19:59", 1)
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = garbage
+
+        cache = _make_cache(
+            lib, garbage, bar_minutes=1, default_count=390, min_bars_per_day=60,
+        )
+        end = datetime.datetime(2024, 10, 17, 23, 59, tzinfo=_UTC)
+        result = cache.get("S", end=end, count=390)
+
+        assert len(result) == 1  # can't do better
+        lib.update.assert_not_called()
+
+    def test_today_skips_sparse_check(self, lib):
+        """Today's date (live session) must not trigger sparse check."""
+        now = pd.Timestamp("2024-10-17 10:30:05", tz=_UTC)
+        # 55 bars from yesterday + 5 from today = 60 total, fresh.
+        # Today has 5 bars < min_bars_per_day=60 → would be sparse,
+        # but today guard skips the check.
+        cached = pd.concat([
+            _intraday_df("2024-10-16 09:30", 55),
+            _intraday_df("2024-10-17 10:26", 5),
+        ])
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = cached
+
+        cache = _make_cache(
+            lib, bar_minutes=1, default_count=390, min_bars_per_day=60,
+        )
+
+        def _now(tz=None):
+            return now.tz_convert(tz) if tz else now.tz_localize(None)
+
+        with patch("arctic_incr_cache.cache.pd.Timestamp.now", side_effect=_now):
+            result = cache.get("S", end=now, count=60)
+
+        # count=60 >= min_bars_per_day=60, so only the today guard prevents
+        # the sparse check from triggering.
+        cache._fetch.assert_not_called()  # type: ignore[union-attr]
+        assert len(result) == 60
+
+    def test_daily_no_false_positive(self, lib):
+        """Daily bars (1 per day) must not trigger sparse check."""
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _daily_df("2024-01-01", 20)
+
+        cache = _make_cache(lib)
+        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
+
+        assert len(result) == 10
+        cache._fetch.assert_not_called()  # type: ignore[union-attr]
+
+    def test_default_min_bars_per_day(self):
+        """Default min_bars_per_day is derived from bar_minutes."""
+        cache = _make_cache(MagicMock(), bar_minutes=1)
+        assert cache.min_bars_per_day == 60
+
+        cache = _make_cache(MagicMock(), bar_minutes=5)
+        assert cache.min_bars_per_day == 12
+
+        cache = _make_cache(MagicMock(), bar_minutes=1440)
+        assert cache.min_bars_per_day == 0
+
