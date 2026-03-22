@@ -129,13 +129,13 @@ class TestIncrementalUpdate:
 
         new = _daily_df("2024-01-11", 10, value_start=200)
         cache = _make_cache(lib, new)
-        result = cache.get("S", end=datetime.date(2024, 1, 20), count=15)
+        result = cache.get("S", end=datetime.date(2024, 1, 20), count=10)
 
-        assert len(result) == 15
+        assert len(result) == 10
         lib.update.assert_called_once()
         fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
         _, _, call_count = fetch_mock.call_args[0]
-        assert call_count == 11
+        assert call_count == 10
 
     def test_deduplicates_unchanged_overlap(self, lib):
         cached = _daily_df("2024-01-01", 10)
@@ -145,7 +145,7 @@ class TestIncrementalUpdate:
         overlap = cached.iloc[[-1]]  # Jan 10, same value
         new_part = _daily_df("2024-01-11", 5, value_start=500)
         cache = _make_cache(lib, pd.concat([overlap, new_part]))
-        cache.get("S", end=datetime.date(2024, 1, 20), count=15)
+        cache.get("S", end=datetime.date(2024, 1, 20), count=10)
 
         stored = lib.update.call_args[0][1]
         assert pd.Timestamp("2024-01-10", tz=_UTC) not in stored.index
@@ -161,7 +161,7 @@ class TestIncrementalUpdate:
         )
         new_part = _daily_df("2024-01-11", 5, value_start=500)
         cache = _make_cache(lib, pd.concat([changed, new_part]))
-        cache.get("S", end=datetime.date(2024, 1, 20), count=15)
+        cache.get("S", end=datetime.date(2024, 1, 20), count=10)
 
         stored = lib.update.call_args[0][1]
         assert pd.Timestamp("2024-01-10", tz=_UTC) in stored.index
@@ -177,7 +177,7 @@ class TestIncrementalUpdate:
         new_dates = pd.date_range("2024-03-10", periods=3, freq="D", tz=_NY)
         new = pd.DataFrame({"value": range(200, 203)}, index=new_dates)
         cache = _make_cache(lib, new, get_tz=lambda _: _NY)
-        cache.get("S", end=datetime.date(2024, 3, 12), count=10)
+        cache.get("S", end=datetime.date(2024, 3, 12), count=5)
 
         fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
         _, _, call_count = fetch_mock.call_args[0]
@@ -240,7 +240,7 @@ class TestIntraday:
         assert call_count == 360
 
     def test_gap_count_uses_minute_resolution(self, lib):
-        cached = _intraday_df("2024-01-15 09:30", 150)
+        cached = _intraday_df("2024-01-15 03:40", 500)  # ends at 11:59
         lib.has_symbol.return_value = True
         lib.read.return_value.data = cached
 
