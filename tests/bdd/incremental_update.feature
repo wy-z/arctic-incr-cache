@@ -11,7 +11,7 @@ Feature: Incremental update
   Scenario: Unchanged overlap row is deduplicated
     Given an ArcticDB library with 10 daily bars from "2024-01-01"
     And an upstream source returning the last cached row unchanged plus 5 new bars from "2024-01-11"
-    When I request 15 bars for "S" ending "2024-01-20"
+    When I request 10 bars for "S" ending "2024-01-20"
     Then the stored data does not contain "2024-01-10"
 
   Scenario: Changed overlap row is kept

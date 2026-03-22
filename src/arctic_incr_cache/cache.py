@@ -348,44 +348,57 @@ class IncrCache:
             self._store(symbol, df)
             return merge(existing, df)
 
-        # Fresh — but fall through if we have fewer rows than requested
-        if self.is_fresh(last, end_ts, tz):
-            trimmed = trim(existing)
-            if len(trimmed) >= count:
-                return trimmed
+        # Short — not enough rows regardless of freshness
+        trimmed = trim(existing)
+        if len(trimmed) < count:
             # Source's oldest known date still valid and cache covers it?
+            floor_valid = False
             floor_entry = self._floor.get(symbol)
             if floor_entry:
                 oldest, expiry, hits = floor_entry
-                if time.time() < expiry and existing.index[0] <= oldest:
+                floor_valid = (
+                    time.time() < expiry
+                    and existing.index[0] <= oldest
+                )
+                if floor_valid:
                     if hits <= len(self.FLOOR_TTLS):
                         log.info(
                             "floor hit %s: oldest=%s (hits=%d)",
                             symbol, oldest, hits,
                         )
-                    return trimmed
+                    if self.is_fresh(last, end_ts, tz):
+                        return trimmed
+                    # Left at floor, right stale → incremental below
 
-            log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
-            df = _normalize(self._fetch(symbol, end_ts, count), tz)
-            if df.empty:
-                self._set_floor(symbol, existing.index[0])
-                return trimmed
-            self._store(symbol, df)
-            if len(df) < count:
-                self._set_floor(symbol, df.index[0])
-            return merge(existing, df)
+            if not floor_valid:
+                log.info(
+                    "short %s: have %d, need %d",
+                    symbol, len(trimmed), count,
+                )
+                df = _normalize(self._fetch(symbol, end_ts, count), tz)
+                if df.empty:
+                    self._set_floor(symbol, existing.index[0])
+                    return trimmed
+                self._store(symbol, df)
+                if len(df) < count:
+                    self._set_floor(symbol, df.index[0])
+                return merge(existing, df)
+
+        # Fresh
+        if self.is_fresh(last, end_ts, tz):
+            return trimmed
 
         # Incremental update — fetch only the stale gap (plus overlap) and merge
         fetch_count = self._calc_stale_fetch_count(last, end_ts, count)
         new = _normalize(self._fetch(symbol, end_ts, fetch_count), tz)
         if new.empty:
-            return trim(existing)
+            return trimmed
 
         new = new.loc[new.index >= last]
         if last in new.index and new.loc[last].equals(existing.loc[last]):
             new = new.iloc[1:]
         if new.empty:
-            return trim(existing)
+            return trimmed
 
         self._store(symbol, new)
         return merge(existing, new)
