@@ -84,8 +84,14 @@ When `get_tz` returns a timezone for a symbol:
 
 ## Interval convention
 
-- **Data & return** — both ends inclusive (`index <= end`). The returned DataFrame includes the bar at `end` if it exists.
-- **Freshness check** — left-closed right-open. The cache considers data fresh when the last cached bar reaches `end - bar_width`, since the bar at `end` itself may not yet exist.
+`end` is a bar timestamp (a point), not a range boundary.
+
+- **Filter** — closed: `index <= end`. `fetch()` must follow the same rule (`start <= ts <= end`); a strict `<` silently drops `bar@end`.
+- **Freshness**:
+  - **Daily** — closed: `last.date() >= end.date()`.
+  - **Intraday** — right-open: `last >= end - bar_width`. An intraday bar at `t` covers `[t, t+bar_width)`, so `bar@end` doesn't exist at session boundaries (e.g. 16:00 close, 20:00 POST end).
+
+A still-updating bar (`now` daily; within `bar_width` intraday) counts as one bar older for freshness — mirroring its exclusion from storage.
 
 ## Index convention
 
