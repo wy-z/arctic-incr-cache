@@ -117,6 +117,26 @@ class TestCacheHit:
         # Should only fetch once — second call sees floor covers existing
         cache._fetch.assert_called_once()  # type: ignore[union-attr]
 
+    def test_floor_backoff_caps_and_reprobes(self, lib):
+        """Floor backoff never turns permanent: past the TTL ladder every
+        expiry re-probes the source, so a floor poisoned by transient
+        empty/short fetches heals instead of freezing the cache short."""
+        lib.has_symbol.return_value = True
+        cached = _daily_df("2024-01-11", 5)
+        lib.read.return_value.data = cached
+
+        cache = _make_cache(lib, cached)  # fetch stays short forever
+        with patch("arctic_incr_cache.cache.time") as mock_time:
+            t = 1_000_000.0
+            for _ in range(5):  # ramps hits well past len(FLOOR_TTLS)
+                mock_time.time.return_value = t
+                cache.get("S", end=datetime.date(2024, 1, 15), count=10)
+                t += IncrCache.FLOOR_TTLS[-1] + 1
+
+        # Every expired floor re-probes — with a permanent floor the
+        # calls after hit 3 would never fetch again.
+        assert cache._fetch.call_count == 5  # type: ignore[union-attr]
+
 
 # ── incremental update ───────────────────────────────────────────
 

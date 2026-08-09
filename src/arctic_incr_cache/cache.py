@@ -85,7 +85,9 @@ class IncrCache:
             calendar days, with a 7-day minimum to span weekends.
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
         floor: Shared floor dict for cross-instance state.
-            Maps symbol to ``(oldest_ts, expiry, hits)``.
+            Maps symbol to ``(oldest_ts, expiry, hits)``.  Keys are bare
+            symbols — give every dataset (library / bar width) its own
+            dict, or one cache's floor will suppress another's backfills.
         cache_ttl: Result TTL in seconds (default 60).
             Repeated ``get()`` calls with the same resolved parameters
             return a cached result within this window.  Set to 0 to disable.
@@ -95,7 +97,7 @@ class IncrCache:
             (≈ 1 hour of bars).  Ignored for daily bars.
     """
 
-    FLOOR_TTLS = (360, 720, 1440)  # 6min, 12min, 24min progressive
+    FLOOR_TTLS = (360, 720, 1440)  # 6/12/24 min backoff, capped at the last
     MIN_LOOKBACK_DAYS = 7  # cover weekends / short holidays
 
     def __init__(
@@ -214,14 +216,13 @@ class IncrCache:
     # ── floor ─────────────────────────────────────────────────────
 
     def _set_floor(self, symbol: str, oldest: pd.Timestamp) -> None:
+        # Backoff caps at the last TTL rather than going permanent: a floor
+        # poisoned by transient empty/short fetches (or a persistent floor
+        # dict outliving the source's real depth) must heal on re-probe.
         prev = self._floor.get(symbol)
         hits = (prev[2] if prev else 0) + 1
-        expiry = (
-            math.inf
-            if hits > len(self.FLOOR_TTLS)
-            else time.time() + self.FLOOR_TTLS[hits - 1]
-        )
-        self._floor[symbol] = (oldest, expiry, hits)
+        ttl = self.FLOOR_TTLS[min(hits, len(self.FLOOR_TTLS)) - 1]
+        self._floor[symbol] = (oldest, time.time() + ttl, hits)
 
     # ── density validation ─────────────────────────────────────────
 
