@@ -33,14 +33,18 @@ log = logging.getLogger(__name__)
 def _normalize(df: pd.DataFrame, tz: datetime.tzinfo) -> pd.DataFrame:
     """Convert to *tz*-aware, deduplicate (keep last), sort.
 
-    tz-naive input raises — every symbol has a configured timezone.
+    Anything but a tz-aware ``DatetimeIndex`` raises.  Every frame — fetched
+    or read back — passes here, so nothing else on the write path has to
+    re-check what reaches ArcticDB.
     """
     if df.empty:
         return df
-    if isinstance(df.index, pd.DatetimeIndex):
-        if df.index.tz is None:
-            raise ValueError("fetch() must return tz-aware timestamps, got tz-naive")
-        df = df.set_axis(df.index.tz_convert(tz))
+    if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
+        raise ValueError(
+            f"expected a tz-aware DatetimeIndex, got {type(df.index).__name__}"
+            f"[{df.index.dtype}]"
+        )
+    df = df.set_axis(df.index.tz_convert(tz))
     return df.loc[~df.index.duplicated(keep="last")].sort_index()
 
 
@@ -88,10 +92,6 @@ class IncrCache:
         cache_ttl: Result TTL in seconds (default 60).
             Repeated ``get()`` calls with the same resolved parameters
             return a cached result within this window.  Set to 0 to disable.
-        min_bars_per_day: Minimum expected complete bars per trading day
-            (intraday only).  Cached dates with fewer bars are treated as
-            corrupt and re-fetched.  Defaults to ``max(1, 60 // bar_minutes)``
-            (≈ 1 hour of bars).  Ignored for daily bars.
     """
 
     FLOOR_TTLS = (360, 720, 1440)  # 6/12/24 min backoff, capped at the last
@@ -111,7 +111,6 @@ class IncrCache:
         lock_class: type | None = None,
         floor: dict[str, tuple[pd.Timestamp, float, int]] | None = None,
         cache_ttl: int = 60,
-        min_bars_per_day: int | None = None,
     ):
         if bar_minutes <= 0:
             raise ValueError("bar_minutes must be > 0")
@@ -120,12 +119,6 @@ class IncrCache:
         self._get_tz = get_tz
         self._is_holey = is_holey
         self.bar_minutes = bar_minutes
-        if self.is_daily:
-            self.min_bars_per_day = 0
-        elif min_bars_per_day is not None:
-            self.min_bars_per_day = min_bars_per_day
-        else:
-            self.min_bars_per_day = max(1, 60 // bar_minutes)
         self.default_count = default_count
         self._spawn = spawn
         self._lock_class = lock_class or threading.Lock
@@ -230,14 +223,7 @@ class IncrCache:
             log.info("floor hit %s: oldest=%s (hits=%d)", symbol, oldest, hits)
         return True
 
-    # ── density validation ─────────────────────────────────────────
-
-    def _is_sparse(self, df: pd.DataFrame, target_date: datetime.date) -> bool:
-        """Return True if *df* has suspiciously few bars on *target_date*."""
-        if self.min_bars_per_day <= 0 or df.empty:
-            return False
-        n = int((pd.DatetimeIndex(df.index).date == target_date).sum())
-        return 0 < n < self.min_bars_per_day
+    # ── continuity validation ──────────────────────────────────────
 
     def _has_hole(self, symbol: str, df: pd.DataFrame) -> bool:
         """True when *df* misses bars over its own span, per ``is_holey``."""
@@ -348,17 +334,9 @@ class IncrCache:
         def merge(*dfs: pd.DataFrame) -> pd.DataFrame:
             return trim(_normalize(pd.concat(dfs), tz))
 
-        target = end_ts.date()
-        # Sparse checks skip today — the trading day is still in progress.
-        target_closed = (
-            count >= self.min_bars_per_day and target < pd.Timestamp.now(tz).date()
-        )
-
         def corrupt_reason(df: pd.DataFrame) -> str | None:
-            """Why *df* is unusable — sparse target date or a mid-series hole
-            in the delivered window — or ``None`` when it is clean."""
-            if target_closed and self._is_sparse(df, target):
-                return f"{target} holds <{self.min_bars_per_day} bars"
+            """Why *df* is unusable — a mid-series hole in the delivered
+            window — or ``None`` when it is clean."""
             window = trim(df)
             if self._has_hole(symbol, window):
                 return (
