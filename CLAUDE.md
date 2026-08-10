@@ -26,7 +26,7 @@ Single-module library: `src/arctic_incr_cache/cache.py`.
 
 1. Read existing data from ArcticDB for the symbol
 2. **Miss** — nothing read: call `fetch()`, validate, store only if clean. A read error reports an empty frame too (`_read` swallows it), so the symbol may hold rows the fetch would replace
-3. **Corrupt** — `corrupt_reason()` finds a sparse target date or a mid-series hole in the delivered window: `refetch_full()` repairs it
+3. **Corrupt** — `corrupt_reason()` finds a mid-series hole in the delivered window: `refetch_full()` repairs it
 4. **Short** — fewer rows than requested and no valid floor: full fetch, validated like a repair (it is a full-window fetch too). A corrupt backfill is served but neither stored nor floored — it is no evidence of how deep the source goes. A clean one is stored, and records the floor when the source stays short
 5. **Fresh** — cached data covers the requested range: return from cache
 6. **Stale** — compute gap size, fetch only new bars, merge with existing, upsert. A gap fetch that skips the cached tail is never stored (would fabricate a hole) — upgraded to `refetch_full()`
