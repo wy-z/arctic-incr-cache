@@ -24,7 +24,8 @@ def _upstream_minute_bars(ctx, n, start):
 
 @given(
     parsers.parse(
-        'an ArcticDB library with {n:d} tz-aware minute bars in "{tz_name}" from "{start}"'
+        "an ArcticDB library with {n:d} tz-aware minute bars "
+        'in "{tz_name}" from "{start}"'
     ),
 )
 def _lib_with_tz_bars(ctx, n, tz_name, start):
@@ -40,15 +41,20 @@ def _lib_with_tz_bars(ctx, n, tz_name, start):
 
 @when(
     parsers.parse(
-        'I request {count:d} bars for "{symbol}" ending "{end}" with timezone "{tz_name}"'
+        'I request {count:d} bars for "{symbol}" ending "{end}" '
+        'with timezone "{tz_name}"'
     ),
 )
 def _request_with_tz(ctx, count, symbol, end, tz_name):
     tz = ZoneInfo(tz_name)
     fetch = MagicMock(return_value=ctx.get("fetch_data", pd.DataFrame()))
     cache = IncrCache(
-        ctx["lib"], fetch, bar_minutes=1, default_count=1950,
-        get_tz=lambda _, t=tz: t, cache_ttl=0,
+        ctx["lib"],
+        fetch,
+        bar_minutes=1,
+        default_count=1950,
+        get_tz=lambda _, t=tz: t,
+        cache_ttl=0,
     )
     end_dt = datetime.datetime.fromisoformat(end).replace(tzinfo=tz)
     ctx["result"] = cache.get(symbol, end=end_dt, count=count)
