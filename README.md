@@ -180,6 +180,9 @@ ArcticDB's `date_range` queries operate on the index, so no column name
 configuration is needed. If your data source returns time as a regular column,
 call `df.set_index("date")` (or similar) inside your `fetch` function.
 
+Anything else — a tz-naive index, or an index that isn't a `DatetimeIndex` at
+all — raises `ValueError` before the frame can be stored.
+
 ## Constructor parameters
 
 | Parameter | Required | Description |

@@ -376,6 +376,22 @@ class TestNormalize:
         with pytest.raises(ValueError, match="tz-aware"):
             _normalize(df, tz=_NY)
 
+    def test_non_datetime_index_raises(self):
+        """A non-``DatetimeIndex`` carries no tz to check, so it must not
+        slip past the gate — an object index of naive stamps is the case
+        that would otherwise reach an ArcticDB write untouched."""
+        from arctic_incr_cache.cache import _normalize
+
+        with pytest.raises(ValueError, match="tz-aware"):
+            _normalize(pd.DataFrame({"v": [1, 2]}), tz=_NY)
+
+        naive_objects = pd.DataFrame(
+            {"v": [1]},
+            index=pd.Index([pd.Timestamp("2024-01-15 12:00")], dtype=object),
+        )
+        with pytest.raises(ValueError, match="tz-aware"):
+            _normalize(naive_objects, tz=_NY)
+
     def test_aware_converted_to_target_tz(self):
         from arctic_incr_cache.cache import _normalize
 

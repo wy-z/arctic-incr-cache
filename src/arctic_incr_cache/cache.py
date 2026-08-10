@@ -33,14 +33,18 @@ log = logging.getLogger(__name__)
 def _normalize(df: pd.DataFrame, tz: datetime.tzinfo) -> pd.DataFrame:
     """Convert to *tz*-aware, deduplicate (keep last), sort.
 
-    tz-naive input raises — every symbol has a configured timezone.
+    Anything but a tz-aware ``DatetimeIndex`` raises.  Every frame — fetched
+    or read back — passes here, so nothing else on the write path has to
+    re-check what reaches ArcticDB.
     """
     if df.empty:
         return df
-    if isinstance(df.index, pd.DatetimeIndex):
-        if df.index.tz is None:
-            raise ValueError("fetch() must return tz-aware timestamps, got tz-naive")
-        df = df.set_axis(df.index.tz_convert(tz))
+    if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
+        raise ValueError(
+            f"expected a tz-aware DatetimeIndex, got {type(df.index).__name__}"
+            f"[{df.index.dtype}]"
+        )
+    df = df.set_axis(df.index.tz_convert(tz))
     return df.loc[~df.index.duplicated(keep="last")].sort_index()
 
 
