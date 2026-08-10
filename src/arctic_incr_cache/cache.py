@@ -30,24 +30,17 @@ log = logging.getLogger(__name__)
 # ── pure helpers ──────────────────────────────────────────────────
 
 
-def _normalize(df: pd.DataFrame, tz: datetime.tzinfo | None = None) -> pd.DataFrame:
+def _normalize(df: pd.DataFrame, tz: datetime.tzinfo) -> pd.DataFrame:
     """Convert to *tz*-aware, deduplicate (keep last), sort.
 
-    *tz* provided → tz-aware input is converted; tz-naive input raises.
-    *tz* is ``None`` → tz-aware input is stripped (keep wall-clock);
-    tz-naive input passes through unchanged.
+    tz-naive input raises — every symbol has a configured timezone.
     """
     if df.empty:
         return df
     if isinstance(df.index, pd.DatetimeIndex):
-        if tz:
-            if df.index.tz is None:
-                raise ValueError(
-                    "fetch() must return tz-aware timestamps, got tz-naive"
-                )
-            df = df.set_axis(df.index.tz_convert(tz))
-        elif df.index.tz is not None:
-            df = df.set_axis(df.index.tz_localize(None))
+        if df.index.tz is None:
+            raise ValueError("fetch() must return tz-aware timestamps, got tz-naive")
+        df = df.set_axis(df.index.tz_convert(tz))
     return df.loc[~df.index.duplicated(keep="last")].sort_index()
 
 
@@ -75,14 +68,18 @@ class IncrCache:
             to the configured timezone internally.
         get_tz: ``get_tz(symbol) -> tzinfo``.
             Determines the storage/comparison timezone for each symbol.
+        is_holey: ``is_holey(symbol, df) -> bool``.
+            True when *df* misses bars its source should hold over its own
+            span — ``df.index[0]..df.index[-1]``, tz-aware in the configured
+            timezone.  Implement with a trading calendar or a heuristic, and
+            size the slack for what the source legitimately misses: the
+            whole verdict is yours.  Frames shorter than 2 bars never reach
+            it — they have no interior to miss.  Defaults to never holey,
+            which disables continuity checks.
         bar_minutes: Bar width in minutes (1440 = daily, 1 = 1-min).
         default_count: Bars returned when *count* is omitted.
         spawn: Fire-and-forget callable for async writes.
             Defaults to daemon threads.  Pass ``gevent.spawn`` for async runtimes.
-        lookback: Read-window multiplier (default 2).
-            Daily: ``count * lookback`` calendar days.
-            Intraday: ``ceil(count * bar_minutes / 1440) * lookback``
-            calendar days, with a 7-day minimum to span weekends.
         lock_class: Lock constructor.  Defaults to ``threading.Lock``.
         floor: Shared floor dict for cross-instance state.
             Maps symbol to ``(oldest_ts, expiry, hits)``.  Keys are bare
@@ -98,6 +95,7 @@ class IncrCache:
     """
 
     FLOOR_TTLS = (360, 720, 1440)  # 6/12/24 min backoff, capped at the last
+    LOOKBACK = 2  # read-window multiplier over the requested bar count
     MIN_LOOKBACK_DAYS = 7  # cover weekends / short holidays
 
     def __init__(
@@ -106,10 +104,10 @@ class IncrCache:
         fetch: Callable[[str, pd.Timestamp, int], pd.DataFrame],
         *,
         get_tz: Callable[[str], datetime.tzinfo],
+        is_holey: Callable[[str, pd.DataFrame], bool] = lambda *_: False,
         bar_minutes: int = 1440,
         default_count: int = 252,
         spawn: Callable[..., Any] | None = None,
-        lookback: int = 2,
         lock_class: type | None = None,
         floor: dict[str, tuple[pd.Timestamp, float, int]] | None = None,
         cache_ttl: int = 60,
@@ -120,8 +118,9 @@ class IncrCache:
         self._lib = library
         self._fetch = fetch
         self._get_tz = get_tz
+        self._is_holey = is_holey
         self.bar_minutes = bar_minutes
-        if bar_minutes >= 1440:
+        if self.is_daily:
             self.min_bars_per_day = 0
         elif min_bars_per_day is not None:
             self.min_bars_per_day = min_bars_per_day
@@ -129,19 +128,19 @@ class IncrCache:
             self.min_bars_per_day = max(1, 60 // bar_minutes)
         self.default_count = default_count
         self._spawn = spawn
-        self.lookback = lookback
         self._lock_class = lock_class or threading.Lock
         self._locks: dict[str, Any] = {}
         self._meta_lock = threading.Lock()
         # Per-symbol (oldest_ts, expiry, hits): skip re-fetch when cache
         # already covers the source's oldest available date.
         self._floor = floor if floor is not None else {}
-        get_impl: Callable[[str, pd.Timestamp, int], pd.DataFrame]
+        self._cached_get: Callable[[str, pd.Timestamp, int], pd.DataFrame]
         if cache_ttl > 0:
-            get_impl = ring.lru(expire=cache_ttl)(self._do_get)  # type: ignore[assignment]
+            memoized: Any = ring.lru(expire=cache_ttl)(self._do_get)
+            # ring hands every caller the same frame — copy so they can mutate
+            self._cached_get = lambda *args: memoized(*args).copy()
         else:
-            get_impl = self._do_get
-        self._cached_get = get_impl
+            self._cached_get = self._do_get
 
     @property
     def is_daily(self) -> bool:
@@ -197,21 +196,15 @@ class IncrCache:
         expected_last = end - backoff
         return safe >= expected_last
 
-    def _calc_stale_fetch_count(
-        self, last: pd.Timestamp, end: pd.Timestamp, count: int
-    ) -> int:
-        """Return bars to fetch for stale updates.
-
-        Fetch the gap plus one overlap bar so callers can refresh the cached tail.
-        If the gap exceeds the requested window, fall back to a full-window fetch.
-        """
+    def _calc_gap_count(self, last: pd.Timestamp, end: pd.Timestamp) -> int:
+        """Bars from *last* to *end*, including one overlap bar at *last*
+        so callers can refresh the cached tail."""
         if self.is_daily:
             gap_count = (end.date() - last.date()).days + 1
         else:
             bar = pd.Timedelta(minutes=self.bar_minutes)
             gap_count = math.floor((end - last) / bar) + 1
-        gap_count = max(gap_count, 1)
-        return min(gap_count, count)
+        return max(gap_count, 1)
 
     # ── floor ─────────────────────────────────────────────────────
 
@@ -224,6 +217,19 @@ class IncrCache:
         ttl = self.FLOOR_TTLS[min(hits, len(self.FLOOR_TTLS)) - 1]
         self._floor[symbol] = (oldest, time.time() + ttl, hits)
 
+    def _at_floor(self, symbol: str, oldest_cached: pd.Timestamp) -> bool:
+        """True when the cache already reaches the source's oldest known bar,
+        so a short window is the source's depth rather than a gap to fill."""
+        entry = self._floor.get(symbol)
+        if not entry:
+            return False
+        oldest, expiry, hits = entry
+        if time.time() >= expiry or oldest_cached > oldest:
+            return False
+        if hits <= len(self.FLOOR_TTLS):
+            log.info("floor hit %s: oldest=%s (hits=%d)", symbol, oldest, hits)
+        return True
+
     # ── density validation ─────────────────────────────────────────
 
     def _is_sparse(self, df: pd.DataFrame, target_date: datetime.date) -> bool:
@@ -232,6 +238,10 @@ class IncrCache:
             return False
         n = int((pd.DatetimeIndex(df.index).date == target_date).sum())
         return 0 < n < self.min_bars_per_day
+
+    def _has_hole(self, symbol: str, df: pd.DataFrame) -> bool:
+        """True when *df* misses bars over its own span, per ``is_holey``."""
+        return len(df) >= 2 and self._is_holey(symbol, df)
 
     # ── storage ───────────────────────────────────────────────────
 
@@ -250,24 +260,38 @@ class IncrCache:
             log.warning("read error %s: %s", symbol, exc)
             return pd.DataFrame()
 
-    def _fire(self, fn: Callable) -> Any:
-        if self._spawn is not None:
-            return self._spawn(fn)
-        t = threading.Thread(target=fn, daemon=True)
-        t.start()
-        return t
+    def _complete(self, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop trailing bars that may still be updating.
+
+        Idempotent, so a caller may prepare a frame and hand that same frame
+        to ``_store`` without the second exclusion eating a complete bar.
+        """
+        if df.empty:
+            return df
+        return df.loc[df.index < self._incomplete_threshold(self._get_tz(symbol))]
 
     def _store(self, symbol: str, df: pd.DataFrame) -> None:
-        """Exclude the incomplete bar, then upsert.
+        """Exclude still-updating bars, then upsert unless *df* is holey.
+
+        This is the integrity boundary: ``update`` replaces the whole span
+        between the frame's first and last timestamp, so a holey frame would
+        delete every cached row inside its gaps.  Such a frame is refused,
+        not written — callers may serve it, but the store keeps what it has.
 
         Data must already be tz-aware in the configured timezone (via
         ``_normalize``) before calling this method.
         """
-        tz = self._get_tz(symbol)
-        threshold = self._incomplete_threshold(tz)
-        if not df.empty and df.index[-1] >= threshold:
-            df = df.iloc[:-1]
+        df = self._complete(symbol, df)
         if df.empty:
+            return
+        if self._has_hole(symbol, df):
+            log.warning(
+                "refusing holey write %s: %s..%s holds only %d bars",
+                symbol,
+                df.index[0],
+                df.index[-1],
+                len(df),
+            )
             return
         rows = len(df)
         span = f"{df.index[0].date()}..{df.index[-1].date()}"
@@ -275,12 +299,17 @@ class IncrCache:
         def write():
             try:
                 with self._lock_for(symbol):
-                    self._lib.update(symbol, df, upsert=True, prune_previous_versions=True)
+                    self._lib.update(
+                        symbol, df, upsert=True, prune_previous_versions=True
+                    )
                 log.info("stored %s %s (+%d rows)", symbol, span, rows)
             except Exception:
                 log.exception("write error %s", symbol)
 
-        self._fire(write)
+        if self._spawn is not None:
+            self._spawn(write)
+        else:
+            threading.Thread(target=write, daemon=True).start()
 
     # ── public API ────────────────────────────────────────────────
 
@@ -302,17 +331,14 @@ class IncrCache:
             count = self.default_count
         if count <= 0:
             return pd.DataFrame()
-        result = self._cached_get(symbol, end_ts, count)
-        return result.copy() if self._cached_get is not self._do_get else result
+        return self._cached_get(symbol, end_ts, count)
 
-    def _do_get(
-        self, symbol: str, end_ts: pd.Timestamp, count: int
-    ) -> pd.DataFrame:
+    def _do_get(self, symbol: str, end_ts: pd.Timestamp, count: int) -> pd.DataFrame:
         tz = self._get_tz(symbol)
         if self.is_daily:
-            start_ts = end_ts - pd.Timedelta(days=count * self.lookback)
+            start_ts = end_ts - pd.Timedelta(days=count * self.LOOKBACK)
         else:
-            cal_days = math.ceil(count * self.bar_minutes / 1440) * self.lookback
+            cal_days = math.ceil(count * self.bar_minutes / 1440) * self.LOOKBACK
             start_ts = end_ts - pd.Timedelta(days=max(cal_days, self.MIN_LOOKBACK_DAYS))
         existing = self._read(symbol, (start_ts, end_ts), tz)
 
@@ -322,80 +348,108 @@ class IncrCache:
         def merge(*dfs: pd.DataFrame) -> pd.DataFrame:
             return trim(_normalize(pd.concat(dfs), tz))
 
-        # Cache miss
+        target = end_ts.date()
+        # Sparse checks skip today — the trading day is still in progress.
+        target_closed = (
+            count >= self.min_bars_per_day and target < pd.Timestamp.now(tz).date()
+        )
+
+        def corrupt_reason(df: pd.DataFrame) -> str | None:
+            """Why *df* is unusable — sparse target date or a mid-series hole
+            in the delivered window — or ``None`` when it is clean."""
+            if target_closed and self._is_sparse(df, target):
+                return f"{target} holds <{self.min_bars_per_day} bars"
+            window = trim(df)
+            if self._has_hole(symbol, window):
+                return (
+                    f"{window.index[0]}..{window.index[-1]} "
+                    f"holds only {len(window)} bars"
+                )
+            return None
+
+        def refetch_full() -> pd.DataFrame | None:
+            """Re-fetch the whole window and store it, or ``None`` when the
+            re-fetch is corrupt too and the caller should fall back."""
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
+            if df.empty or corrupt_reason(df):
+                return None
+            self._store(symbol, df)
+            return merge(existing, df)
+
+        # Cache miss.  A read error also lands here (``_read`` reports an
+        # empty frame), so the symbol may well hold rows this fetch would
+        # replace — validate before storing, like every other write path.
         if existing.empty:
             log.info("miss %s, fetching %d bars", symbol, count)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if not df.empty:
-                self._store(symbol, df)
+                if reason := corrupt_reason(df):
+                    log.warning("corrupt fetch %s: %s, not storing", symbol, reason)
+                else:
+                    self._store(symbol, df)
             return trim(df)
 
-        # Sparse — target date has too few bars, full re-fetch
-        # Skip for today: the trading day is still in progress.
         last = existing.index[-1]
-        target = end_ts.date()
-        if (
-            count >= self.min_bars_per_day
-            and target < pd.Timestamp.now(tz).date()
-            and self._is_sparse(existing, target)
-        ):
-            log.warning(
-                "sparse %s on %s (need >=%d bars), refetching",
-                symbol, target, self.min_bars_per_day,
-            )
-            df = _normalize(self._fetch(symbol, end_ts, count), tz)
-            if df.empty or self._is_sparse(df, target):
-                return trim(existing)
-            self._store(symbol, df)
-            return merge(existing, df)
-
-        # Short — not enough rows regardless of freshness
         trimmed = trim(existing)
-        if len(trimmed) < count:
-            # Source's oldest known date still valid and cache covers it?
-            floor_valid = False
-            floor_entry = self._floor.get(symbol)
-            if floor_entry:
-                oldest, expiry, hits = floor_entry
-                floor_valid = (
-                    time.time() < expiry
-                    and existing.index[0] <= oldest
-                )
-                if floor_valid:
-                    if hits <= len(self.FLOOR_TTLS):
-                        log.info(
-                            "floor hit %s: oldest=%s (hits=%d)",
-                            symbol, oldest, hits,
-                        )
-                    if self.is_fresh(last, end_ts, tz):
-                        return trimmed
-                    # Left at floor, right stale → incremental below
 
-            if not floor_valid:
-                log.info(
-                    "short %s: have %d, need %d",
-                    symbol, len(trimmed), count,
-                )
-                df = _normalize(self._fetch(symbol, end_ts, count), tz)
-                if df.empty:
-                    self._set_floor(symbol, existing.index[0])
-                    return trimmed
-                self._store(symbol, df)
-                if len(df) < count:
-                    self._set_floor(symbol, df.index[0])
+        # Corrupt cache — repair with a validated full re-fetch
+        if reason := corrupt_reason(existing):
+            log.warning("corrupt %s: %s, refetching", symbol, reason)
+            repaired = refetch_full()
+            return trimmed if repaired is None else repaired
+
+        # Short — not enough rows, and the source isn't known to be exhausted
+        if len(trimmed) < count and not self._at_floor(symbol, existing.index[0]):
+            log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
+            if df.empty:
+                self._set_floor(symbol, existing.index[0])
+                return trimmed
+            # Same validation as a repair — this is a full-window fetch too.
+            # A corrupt backfill is served but never stored, and never
+            # floored: it says nothing about how deep the source goes, and
+            # flooring on it would suppress the retry.
+            if reason := corrupt_reason(df):
+                log.warning("corrupt backfill %s: %s", symbol, reason)
                 return merge(existing, df)
+            storable = self._complete(symbol, df)
+            self._store(symbol, storable)
+            if len(df) < count and not self._has_hole(symbol, storable):
+                self._set_floor(symbol, df.index[0])
+            return merge(existing, df)
 
         # Fresh
         if self.is_fresh(last, end_ts, tz):
             return trimmed
 
         # Incremental update — fetch only the stale gap (plus overlap) and merge
-        fetch_count = self._calc_stale_fetch_count(last, end_ts, count)
+        gap_count = self._calc_gap_count(last, end_ts)
+        fetch_count = min(gap_count, count)  # large gap → full-window fetch
         new = _normalize(self._fetch(symbol, end_ts, fetch_count), tz)
         if new.empty:
             return trimmed
 
         new = new.loc[new.index >= last]
+        if new.empty:
+            return trimmed
+        # Checked before the overlap is deduplicated, so the span still
+        # reaches the cached tail: a hole between ``last`` and the first new
+        # bar is invisible in the frame that would be written.  Either the
+        # un-truncated fetch skipped ``last`` outright, or it came back gappy
+        # — storing it would leave a gap the source may not have.  Re-fetch
+        # the full window; if that is corrupt too, serve it unstored.
+        skipped_tail = fetch_count == gap_count and new.index[0] > last
+        if skipped_tail or self._has_hole(symbol, new):
+            log.warning(
+                "discontinuous fetch %s: %s..%s vs cached tail %s, refetching",
+                symbol,
+                new.index[0],
+                new.index[-1],
+                last,
+            )
+            repaired = refetch_full()
+            return merge(existing, new) if repaired is None else repaired
+
         if last in new.index and new.loc[last].equals(existing.loc[last]):
             new = new.iloc[1:]
         if new.empty:

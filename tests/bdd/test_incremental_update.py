@@ -14,7 +14,8 @@ scenarios("incremental_update.feature")
 
 @given(
     parsers.parse(
-        'an upstream source with {n:d} daily bars from "{start}" starting at value {v:d}'
+        'an upstream source with {n:d} daily bars from "{start}" '
+        "starting at value {v:d}"
     ),
 )
 def _upstream_with_value(ctx, n, start, v):
@@ -23,7 +24,7 @@ def _upstream_with_value(ctx, n, start, v):
 
 @given(
     parsers.parse(
-        'an upstream source returning the last cached row unchanged'
+        "an upstream source returning the last cached row unchanged"
         ' plus {n:d} new bars from "{start}"'
     ),
 )
@@ -34,7 +35,7 @@ def _upstream_unchanged_overlap(ctx, n, start):
 
 @given(
     parsers.parse(
-        'an upstream source returning the last cached row changed'
+        "an upstream source returning the last cached row changed"
         ' plus {n:d} new bars from "{start}"'
     ),
 )

@@ -26,7 +26,11 @@ def _upstream_ending_today(ctx):
 def _request_no_end(ctx):
     fetch = MagicMock(return_value=ctx.get("fetch_data", pd.DataFrame()))
     cache = IncrCache(
-        ctx["lib"], fetch, get_tz=lambda _: _UTC, bar_minutes=1440, default_count=252,
+        ctx["lib"],
+        fetch,
+        get_tz=lambda _: _UTC,
+        bar_minutes=1440,
+        default_count=252,
         cache_ttl=0,
     )
     ctx["result"] = cache.get("S", count=10)
