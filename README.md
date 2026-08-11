@@ -96,10 +96,27 @@ A still-updating bar (`now` daily; within `bar_width` intraday) counts as one ba
 
 ## Continuity
 
-The cache never invents continuity the source doesn't have — but it must not
-*lose* bars the source does have (a partial write, a fetch that skipped the
-cached tail). Mid-series hole detection is **opt-in**: supply `is_holey` and
-every delivered window is put to it.
+The cache never invents continuity the source doesn't have. What it can do is
+notice the absence, at both ends of the store, once you say what "complete"
+means for your data.
+
+Supply `is_holey` and you get one invariant: **every frame this cache writes
+passes it, and every stored window it reads is checked.** Not that the store
+is clean — a hole another writer left outlives a re-fetch carrying the same
+hole, because refusing that write leaves the old rows where they are, and a
+hole can open at the seam between two contiguous writes without either frame
+failing the hook.
+
+- **On write** — a holey frame is refused. Storing it would buy nothing (the
+  next read finds the hole and fetches the window again) and cost plenty:
+  `update` replaces the whole span between a frame's first and last timestamp,
+  so writing a holey frame deletes every cached row inside its gaps. That is
+  what protects a store something else also writes — another process, a
+  scheduled repair job.
+- **On read** — a holey stored window is re-fetched. No frame written here
+  contained that gap, so only the source can say what belongs in it.
+
+Either way the frame reaches the caller. Refusing a write never drops data.
 
 ```python
 import math
@@ -122,55 +139,40 @@ cache = IncrCache(
 )
 ```
 
-- **`is_holey(symbol, df)`** — True when `df` misses bars its source should
-  hold over its own span, `df.index[0]..df.index[-1]`, tz-aware in the
-  configured timezone. Build it on a trading calendar
-  (e.g. [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars))
-  or a heuristic. Frames under 2 bars have no interior and never reach it.
-  Defaults to never holey, which disables the check.
+**`is_holey(symbol, df)`** — True when `df` misses bars its source should hold
+over its own span, `df.index[0]..df.index[-1]`, tz-aware in the configured
+timezone. Build it on a trading calendar
+(e.g. [exchange_calendars](https://github.com/gerrymanoim/exchange_calendars))
+or a heuristic. Frames under 2 bars have no interior and never reach it.
+Defaults to never holey, which makes both ends inert.
 
 The cache keeps no tolerance of its own — how much the source may
 legitimately miss is a property of that source, so the whole verdict lives in
-your hook.
+your hook. Size the slack accordingly, and calibrate it per dataset: a grid
+that fits daily equity bars will mis-grade a dataset whose per-symbol history
+is fragmentary, and there is no appeal.
 
-A hole has two consequences:
+### The one cost
 
-- **Read side** — a delivered window missing more bars than tolerated
-  triggers a full re-fetch, validated the same way.
-- **Write side** — no frame that fails the check is written, whatever path
-  produced it (first fetch, backfill, gap merge, repair). It is still
-  served; it just never reaches the store, because `update` would delete the
-  good rows sitting inside its gaps (see below).
-- **The seam** — a gap fetch is checked *before* its overlap row with the
-  cached tail is deduplicated, so a hole between the cached tail and the
-  first genuinely new bar is caught too. That hole lives in neither frame
-  alone, only in the join.
-
-A gap fetch that fails any of these is upgraded to a validated full
-re-fetch. One part of the gate needs no hooks at all: if the fetch window
-covered the cached tail but the earliest bar returned lands *after* it, the
-source skipped that tail and storing the result would fabricate a hole.
-
-Calibrate `is_holey` against what the source really delivers. Call a frame
-holey that the source can never improve on and every window looks corrupt:
-the data is served but never cached, and the backfill floor that normally
-suppresses hopeless re-fetches is never recorded — costing one full re-fetch
-per result-TTL window, indefinitely. When in doubt, widen the slack or leave
-`is_holey` at its default.
+A window your hook rejects that the source cannot supply either is asked for
+again on every read that misses the result cache — once per `cache_ttl` per
+reader, indefinitely, and the bill scales with how wide a window and how often
+a consumer asks for it. The cache has no way out of that on its own: it can
+only ask, and the source has already answered. Resolving it means repairing
+the store, or fixing a hook that is grading a complete frame as incomplete.
+Both are outside this library.
 
 ## Storage semantics
 
 Stores use ArcticDB `update`, which **replaces the entire span** between the
 first and last timestamp of the stored frame: cached rows inside that span
 that the new fetch doesn't contain are deleted. Every write is therefore a
-potential deletion, which is why a frame failing the [continuity](#continuity)
-check is refused rather than written.
+potential deletion, which is what the `is_holey` write guard exists to stop.
 
-With continuity disabled (the default) there is nothing to check against:
-fetch is the source of truth, and a fetch with holes (e.g. an upstream
-returning partial data) erases the cached rows in those holes. Make `fetch()`
-return complete data for the range it covers, or return empty on failure
-rather than a partial result.
+Without the hook, fetch is the source of truth, and a fetch with holes (e.g.
+an upstream returning partial data) erases the cached rows in those holes.
+Make `fetch()` return complete data for the range it covers, or return empty
+on failure rather than a partial result.
 
 ## Index convention
 
@@ -190,7 +192,7 @@ all — raises `ValueError` before the frame can be stored.
 | `library` | yes | ArcticDB library instance |
 | `fetch(symbol, end, count)` | yes | Fetch raw data from upstream; must return tz-aware timestamps |
 | `get_tz(symbol)` | yes | Market timezone (`tzinfo`) for each symbol |
-| `is_holey(symbol, df)` | no | True when the frame misses bars over its own span; default `False` disables continuity checks |
+| `is_holey(symbol, df)` | no | True when the frame misses bars over its own span. Holey frames are never written; a holey stored window is re-fetched |
 | `bar_minutes` | no | Bar width in minutes (default 1440 = daily) |
 | `default_count` | no | Bars returned when `count` is omitted (default 252) |
 | `spawn` | no | Fire-and-forget callable for async writes (default: daemon thread) |

@@ -25,13 +25,18 @@ Single-module library: `src/arctic_incr_cache/cache.py`.
 ### Cache flow (`get()`)
 
 1. Read existing data from ArcticDB for the symbol
-2. **Miss** — nothing read: call `fetch()`, validate, store only if clean. A read error reports an empty frame too (`_read` swallows it), so the symbol may hold rows the fetch would replace
-3. **Corrupt** — `corrupt_reason()` finds a mid-series hole in the delivered window: `refetch_full()` repairs it
-4. **Short** — fewer rows than requested and no valid floor: full fetch, validated like a repair (it is a full-window fetch too). A corrupt backfill is served but neither stored nor floored — it is no evidence of how deep the source goes. A clean one is stored, and records the floor when the source stays short
+2. **Miss** — nothing read: call `fetch()` and offer it to `_store()`. A read error reports an empty frame too (`_read` swallows it), so the symbol may hold rows the fetch would replace
+3. **Holey** — the stored window fails `is_holey`: full fetch, offered to `_store()`, merged over the stored rows
+4. **Short** — fewer rows than requested and no valid floor: full fetch, offered to `_store()`, and the floor recorded when the source stays short
 5. **Fresh** — cached data covers the requested range: return from cache
-6. **Stale** — compute gap size, fetch only new bars, merge with existing, upsert. A gap fetch that skips the cached tail is never stored (would fabricate a hole) — upgraded to `refetch_full()`
+6. **Stale** — compute gap size, fetch only new bars, merge with existing, offer to `_store()`
 
-`corrupt_reason()` and `refetch_full()` are closures in `_do_get`: the same validator decides whether cached data is broken and whether a repair is safe to store.
+A fetched frame is never withheld from the caller. The source is
+authoritative: whatever it returns is the data, and a cache that second-
+guesses it has no higher court to appeal to — it can only ask again, which is
+a loop with no exit. Bad source data is the consumer's problem. The frame is
+still graded for *persistence* — see the write guard below — but a refused
+write returns the frame all the same.
 
 ### Timezone model
 
@@ -47,13 +52,40 @@ When `get_tz` returns a timezone for a symbol:
 
 ### Continuity model
 
-Opt-in via the `is_holey(symbol, df)` constructor callable (default returns False = disabled). `_has_hole()` guards it with the 2-bar minimum — a shorter frame has no interior — and otherwise delegates the whole verdict, slack included; the cache owns no tolerance of its own. It is applied on a different frame at each of:
+`is_holey(symbol, df)` buys **one invariant: every frame this cache writes
+passes it, and every stored window it reads is checked.** Not "the store is
+clean" — a hole another writer left survives a re-fetch that carries the same
+hole, since the refused write leaves the old rows where they are, and a hole
+can open at the seam between two contiguous writes without either frame
+failing the hook.
+`_has_hole()` guards the hook with the 2-bar minimum — a shorter frame has no
+interior — and otherwise delegates the whole verdict, slack included; the
+cache owns no tolerance of its own.
 
-- **Read side** — `corrupt_reason()` checks the *delivered window* (`trim(existing)`, not the whole store) to decide whether to repair
-- **Write side** — `_store()` checks the *frame being written*, after the incomplete bar is dropped, and refuses a holey one
-- **Seam** — the incremental branch checks the gap fetch *before* the overlap row is deduplicated, so its span still reaches the cached tail. A hole between the cached tail and the first new bar exists in neither frame alone and would otherwise be invisible
+Two consult sites, one at each end of the store:
 
-Each is needed: ArcticDB `update` replaces the stored frame's whole span, so the write check is what stops a holey frame from deleting good rows — and it covers every store path (miss, backfill, gap merge, repair) instead of relying on each caller to validate. A refused frame is still served, just not stored. The discontinuous-fetch write gate runs regardless of the hooks. The cache guarantees fidelity to the fetch source, never continuity the source doesn't have.
+- `_store()`, on the frame being written, after the incomplete bar is dropped.
+  Holey → refused, no exceptions. ArcticDB `update` replaces the frame's whole
+  span, so writing one deletes every cached row inside its gaps; and storing
+  it would only have the next read fetch the same window again.
+- `_do_get()`, on the trimmed stored window, before the short and stale
+  branches. Holey → full re-fetch. No frame written here contained that gap;
+  only the source can say what belongs in it.
+
+A refused frame is still served. Refusing a write never drops data.
+
+**The accepted cost.** A window the hook rejects that the source cannot supply
+either is re-asked once per `cache_ttl` per reader, indefinitely. One
+production incident measured 79 re-fetches of a 12-year daily window in twelve
+hours, but that is one consumer's window and refresh cadence, not a ceiling:
+the bill is (readers × distinct windows × refreshes), and a consumer asking
+for 24 years on a six-minute cron pays far more. There
+is no bound the cache can apply that is not a guess about a question only the
+source can answer; three attempts at one (a cooldown, a depth ladder, a
+stored-state fingerprint) each left the loop reachable another way. Resolution
+is repairing the store, or fixing a hook grading a complete frame as
+incomplete — that one was the real cause of the production case, and both are
+outside this library.
 
 ### Other design details
 
