@@ -234,6 +234,18 @@ class IncrCache:
         """True when *df* misses bars over its own span, per ``is_holey``."""
         return len(df) >= 2 and self._is_holey(symbol, df)
 
+    def _usable(self, symbol: str, df: pd.DataFrame) -> bool:
+        """Whether a fetched frame is fit to keep.
+
+        Judged on exactly the frame ``_store`` would write — completed, not
+        trimmed — so a caller deciding whether the fetch was worth anything
+        can never reach a different verdict than the store does.  Judging the
+        delivered window instead lets a frame pass here and be refused there,
+        which reads as success while nothing is ever stored.
+        """
+        completed = self._complete(symbol, df)
+        return not completed.empty and not self._has_hole(symbol, completed)
+
     def _cool_repair(self, symbol: str, count: int) -> None:
         """Record a full-window fetch that came back unusable.
 
@@ -287,12 +299,18 @@ class IncrCache:
     def _store(self, symbol: str, df: pd.DataFrame) -> None:
         """Exclude still-updating bars, then upsert unless *df* is holey.
 
-        This is the integrity boundary, and the invariant it defends is that
-        no holey frame overwrites rows already in the store: ``update``
-        replaces the whole span between the frame's first and last timestamp,
-        so a holey frame would delete every cached row inside its gaps.  Such
-        a frame is refused — callers may serve it, but the store keeps what it
-        has.  Where there is nothing to keep, see :meth:`_write`.
+        This is the integrity boundary, and the one write path — subclasses
+        and deployments that police who may write override this method, so
+        nothing else may reach ``update``.
+
+        The invariant is that no holey frame overwrites rows already in the
+        store: ``update`` replaces the whole span between the frame's first
+        and last timestamp, so a holey frame would delete every cached row
+        inside its gaps.  With no rows under it there is nothing to defend,
+        and refusing there is what makes the miss permanent — the frame is
+        never stored, so the next read is another miss and another
+        full-window fetch.  Hence ``has_symbol``, not emptiness: a read error
+        also reports an empty frame, and rows can sit outside the read window.
 
         Data must already be tz-aware in the configured timezone (via
         ``_normalize``) before calling this method.
@@ -300,7 +318,7 @@ class IncrCache:
         df = self._complete(symbol, df)
         if df.empty:
             return
-        if self._has_hole(symbol, df):
+        if self._has_hole(symbol, df) and self._lib.has_symbol(symbol):
             log.warning(
                 "refusing holey write %s: %s..%s holds only %d bars",
                 symbol,
@@ -308,12 +326,6 @@ class IncrCache:
                 df.index[-1],
                 len(df),
             )
-            return
-        self._write(symbol, df)
-
-    def _write(self, symbol: str, df: pd.DataFrame) -> None:
-        """Upsert *df*, no questions asked.  Callers own the invariant."""
-        if df.empty:
             return
         rows = len(df)
         span = f"{df.index[0].date()}..{df.index[-1].date()}"
@@ -370,62 +382,48 @@ class IncrCache:
         def merge(*dfs: pd.DataFrame) -> pd.DataFrame:
             return trim(_normalize(pd.concat(dfs), tz))
 
-        def corrupt_reason(df: pd.DataFrame) -> str | None:
-            """Why *df* is unusable — a mid-series hole in the delivered
-            window — or ``None`` when it is clean."""
-            window = trim(df)
-            if self._has_hole(symbol, window):
-                return (
-                    f"{window.index[0]}..{window.index[-1]} "
-                    f"holds only {len(window)} bars"
-                )
-            return None
+        def full_fetch() -> tuple[pd.DataFrame, bool]:
+            """Fetch the whole window, store it, record the outcome.
+
+            Every full-window ask goes through here, and the usability
+            verdict is reached once, so no two callers can disagree about
+            whether the fetch was worth anything.  This is also the only
+            place the cooldown is set or cleared — the ask and its verdict
+            live together, and nothing else has the standing to judge it.
+
+            ``_store`` decides for itself whether to write; it is the only
+            thing allowed to, and it may decline for reasons that have
+            nothing to do with the data.
+            """
+            df = _normalize(self._fetch(symbol, end_ts, count), tz)
+            usable = self._usable(symbol, df)
+            if usable:
+                self._repair.pop((symbol, count), None)
+            else:
+                self._cool_repair(symbol, count)
+            self._store(symbol, df)
+            return df, usable
 
         def refetch_full(reason: str) -> pd.DataFrame | None:
-            """Re-fetch the whole window and store it, or ``None`` when the
-            source cannot mend it and the caller should fall back.
+            """Re-fetch the whole window, or ``None`` when the source cannot
+            mend it and the caller should fall back.
 
             *reason* is why the caller wants a repair; it is logged only when
-            one is actually attempted.  A re-fetch that comes back unusable
-            cools the symbol off, because the next read would otherwise ask
+            one is actually attempted, since the next read would otherwise ask
             the same question and pay for the same answer.
             """
             if self._repair_cooling(symbol, count):
                 return None
             log.warning("corrupt %s: %s, refetching", symbol, reason)
-            df = _normalize(self._fetch(symbol, end_ts, count), tz)
-            if df.empty or corrupt_reason(df):
-                self._cool_repair(symbol, count)
-                return None
-            self._repair.pop((symbol, count), None)
-            self._store(symbol, df)
-            return merge(existing, df)
+            df, usable = full_fetch()
+            return merge(existing, df) if usable else None
 
         # Cache miss.  A read error also lands here (``_read`` reports an
         # empty frame), so the symbol may well hold rows this fetch would
-        # replace — validate before storing, like every other write path.
+        # replace — `_store` is what tells those two apart.
         if existing.empty:
             log.info("miss %s, fetching %d bars", symbol, count)
-            df = _normalize(self._fetch(symbol, end_ts, count), tz)
-            if df.empty:
-                return df
-            if reason := corrupt_reason(df):
-                if self._lib.has_symbol(symbol):
-                    # Rows exist, they just fall outside this read window — a
-                    # write could still land on top of them.
-                    log.warning("corrupt fetch %s: %s, not storing", symbol, reason)
-                    self._cool_repair(symbol, count)
-                else:
-                    # Nothing in the store to overwrite, so the guard has
-                    # nothing to defend.  Refusing here would be permanent:
-                    # the frame is never stored, so the next read is another
-                    # miss and another full-window fetch, forever.
-                    log.warning("holey first write %s: %s, storing", symbol, reason)
-                    self._write(symbol, self._complete(symbol, df))
-            else:
-                self._repair.pop((symbol, count), None)
-                self._store(symbol, df)
-            return trim(df)
+            return trim(full_fetch()[0])
 
         last = existing.index[-1]
         trimmed = trim(existing)
@@ -435,8 +433,11 @@ class IncrCache:
         # hole is what it is, and the tail still has to stay fresh.  What the
         # ordinary path stores from here on is the tail, whose own span
         # excludes the hole, so it cannot widen it.
-        if reason := corrupt_reason(existing):
-            repaired = refetch_full(reason)
+        if self._has_hole(symbol, trimmed):
+            repaired = refetch_full(
+                f"{trimmed.index[0]}..{trimmed.index[-1]} "
+                f"holds only {len(trimmed)} bars"
+            )
             if repaired is not None:
                 return repaired
 
@@ -449,23 +450,14 @@ class IncrCache:
             and not self._repair_cooling(symbol, count)
         ):
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
-            df = _normalize(self._fetch(symbol, end_ts, count), tz)
+            df, usable = full_fetch()
             if df.empty:
                 self._set_floor(symbol, existing.index[0])
                 return trimmed
-            # Same validation as a repair — this is a full-window fetch too,
-            # so it cools off the same way.  Served but never stored, and
-            # never floored: it says nothing about how deep the source goes,
-            # and flooring on it would suppress a retry the cooldown already
-            # paces.
-            if reason := corrupt_reason(df):
-                log.warning("corrupt backfill %s: %s", symbol, reason)
-                self._cool_repair(symbol, count)
-                return merge(existing, df)
-            self._repair.pop((symbol, count), None)
-            storable = self._complete(symbol, df)
-            self._store(symbol, storable)
-            if len(df) < count and not self._has_hole(symbol, storable):
+            # An unusable backfill is served, and floored only on depth: it
+            # says nothing about how deep the source goes, and flooring on it
+            # would suppress a retry the cooldown already paces.
+            if usable and len(df) < count:
                 self._set_floor(symbol, df.index[0])
             return merge(existing, df)
 
@@ -497,6 +489,11 @@ class IncrCache:
             )
             return merge(existing, new) if repaired is None else repaired
 
+        # A gap wider than the window makes this a full-window fetch by size,
+        # but not by verdict: what gets stored is the tail after `>= last`, so
+        # a clean one says nothing about the holey prefix the cooldown is
+        # about.  The ladder is cleared where the ask is judged, and nowhere
+        # else — same as the floor, whose hits a success does not reset either.
         if last in new.index and new.loc[last].equals(existing.loc[last]):
             new = new.iloc[1:]
         if new.empty:
