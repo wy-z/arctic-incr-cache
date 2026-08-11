@@ -1,6 +1,6 @@
 [project]
 name = "arctic-incr-cache"
-version = "0.1.28"
+version = "0.1.29"
 description = "ArcticDB-backed time series cache with incremental updates — fetch once, upsert the gap."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -38,7 +38,6 @@ dev = [
     "pytest>=8.3.3",
     "ruff>=0.6.4",
     "isort>=5.13.2",
-    "pytest-mock>=3.14.0",
     "pyright>=1.1.407",
     "pandas-stubs>=2.3.3.251219",
     "pytest-bdd>=8.1.0",

@@ -8,7 +8,6 @@ Every symbol has a configured timezone via ``get_tz(symbol) -> tzinfo``.
   timezone (e.g., ``America/New_York``).
 * **Fetch contract** — ``fetch()`` must return a tz-aware DataFrame.
   Timestamps are converted to the configured timezone internally.
-
 * **Return** — ``get()`` returns a tz-aware DataFrame in the configured
   timezone.
 """
@@ -49,10 +48,15 @@ def _normalize(df: pd.DataFrame, tz: datetime.tzinfo) -> pd.DataFrame:
 
 
 def _trim(df: pd.DataFrame, end: pd.Timestamp, count: int) -> pd.DataFrame:
-    """Keep rows <= *end*, return the last *count*."""
+    """Keep rows <= *end*, return the last *count*.
+
+    Copied, not sliced: a tail is a view onto the whole frame it came from,
+    and this one is what the result cache holds — a hundred rows would pin
+    the window they were cut out of for as long as the entry lives.
+    """
     if df.empty:
         return df
-    return df.loc[df.index <= end].tail(count)
+    return df.loc[df.index <= end].tail(count).copy()
 
 
 # ── cache ─────────────────────────────────────────────────────────
@@ -99,6 +103,7 @@ class IncrCache:
     FLOOR_TTLS = (360, 720, 1440)  # 6/12/24 min backoff, capped at the last
     LOOKBACK = 2  # read-window multiplier over the requested bar count
     MIN_LOOKBACK_DAYS = 7  # cover weekends / short holidays
+    MAX_WIDEN = 4  # ceiling on the widened re-read, in base windows
 
     def __init__(
         self,
@@ -156,25 +161,52 @@ class IncrCache:
         if end is None:
             return pd.Timestamp.now(tz)
         if type(end) is datetime.date:
+            # Egypt and Chile change their clocks at midnight, which stretches
+            # a day to 25 hours and makes its last hour happen twice.  The end
+            # of that day is the second one; taking the first drops an hour of
+            # bars from the window the caller asked for.
             return pd.Timestamp(
-                datetime.datetime.combine(end, datetime.time.max), tz=tz
-            )
+                datetime.datetime.combine(end, datetime.time.max)
+            ).tz_localize(tz, ambiguous=False, nonexistent="shift_backward")
         ts = pd.Timestamp(end)
         if ts.tzinfo:
             return ts.tz_convert(tz)
         return pd.Timestamp(ts.to_pydatetime().astimezone()).tz_convert(tz)
 
     def _align_bar(self, ts: pd.Timestamp) -> pd.Timestamp:
-        """Floor *ts* to the bar boundary."""
-        if self.is_daily:
-            return ts.normalize()
-        return ts.floor(f"{self.bar_minutes}min")
+        """The last bar boundary at or before *ts* — or *ts*, where none is.
+
+        Flooring re-reads wall time, which a clock change makes ambiguous (an
+        hour repeats) or impossible (an hour is skipped) — and midnight is
+        such an hour in Havana and Santiago, so the daily boundary is no safer
+        than an intraday one.  What is wanted is the latest boundary that is
+        not past *ts*: of a repeated hour's two instants that is the second,
+        unless *ts* is itself the first.  A boundary in a skipped hour shifts
+        forward instead, which under a sub-hour shift can also overshoot.
+
+        A boundary that fell *before* the clocks went back stays out of reach,
+        since flooring reads a wall clock that has run backwards over it, and
+        the window comes back an hour short.  Reaching it takes an off-grid
+        clock change or a bar width that does not divide the hour; of the
+        seventeen zones measured, only Chatham does, and it hosts no exchange.
+        """
+        freq = "D" if self.is_daily else f"{self.bar_minutes}min"
+        floored = ts.floor(freq, ambiguous=False, nonexistent="shift_forward")
+        if floored > ts:
+            floored = ts.floor(freq, ambiguous=True, nonexistent="shift_forward")
+        return min(floored, ts)
 
     def _incomplete_threshold(self, tz: datetime.tzinfo) -> pd.Timestamp:
-        """Bars at or after this tz-aware timestamp may still be updating."""
+        """Bars at or after this tz-aware timestamp may still be updating.
+
+        Today started at its *first* midnight — not ``_align_bar``'s, which
+        follows the caller into whichever half of a repeated midnight it asked
+        about.  Take the second one and today's own bar reads as finished.
+        """
+        now = pd.Timestamp.now(tz)
         if self.is_daily:
-            return pd.Timestamp.now(tz).normalize()
-        return pd.Timestamp.now(tz) - pd.Timedelta(minutes=self.bar_minutes)
+            return now.floor("D", ambiguous=True, nonexistent="shift_forward")
+        return now - pd.Timedelta(minutes=self.bar_minutes)
 
     def is_fresh(
         self, last: pd.Timestamp, end: pd.Timestamp, tz: datetime.tzinfo
@@ -248,16 +280,6 @@ class IncrCache:
             log.warning("read error %s: %s", symbol, exc)
             return pd.DataFrame()
 
-    def _complete(self, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
-        """Drop trailing bars that may still be updating.
-
-        Idempotent, so a caller may prepare a frame and hand that same frame
-        to ``_store`` without the second exclusion eating a complete bar.
-        """
-        if df.empty:
-            return df
-        return df.loc[df.index < self._incomplete_threshold(self._get_tz(symbol))]
-
     def _store(self, symbol: str, df: pd.DataFrame) -> None:
         """Exclude still-updating bars, then upsert — unless the frame is holey.
 
@@ -267,16 +289,17 @@ class IncrCache:
         A holey frame is refused, which is what makes "this cache never wrote a
         frame with a hole in it" an invariant rather than a hope, and what
         lets the read path treat a hole it finds as not its own.  Storing one
-        buys
-        nothing: the read would only fetch the window again, and ``update``
-        replaces the whole span between the frame's first and last timestamp,
-        so writing it would delete cached rows in its gaps.  The frame still
-        reaches the caller — refusing a write never drops data.
+        buys nothing: the read would only fetch the window again, and
+        ``update`` replaces the whole span between the frame's first and last
+        timestamp, so writing it would delete cached rows in its gaps.  The
+        frame still reaches the caller — refusing a write never drops data.
 
         Data must already be tz-aware in the configured timezone (via
         ``_normalize``) before calling this method.
         """
-        df = self._complete(symbol, df)
+        if df.empty:
+            return
+        df = df.loc[df.index < self._incomplete_threshold(self._get_tz(symbol))]
         if df.empty:
             return
         if self._has_hole(symbol, df):
@@ -328,29 +351,62 @@ class IncrCache:
             return pd.DataFrame()
         return self._cached_get(symbol, end_ts, count)
 
+    def _read_window(
+        self, symbol: str, end_ts: pd.Timestamp, count: int, tz: datetime.tzinfo
+    ) -> pd.DataFrame:
+        """The stored rows that should hold *count* bars ending at *end_ts*.
+
+        Sized in calendar days, because that is what the store is indexed by —
+        but the window is elapsed time and bars are not.  A market open four
+        hours a day puts a quarter of its bars in one, so the ask comes up
+        short against a store holding every one of them just outside.  Measure
+        the density that read revealed, widen by it, and ask again: being
+        wrong in front of the store is far cheaper than in front of the source.
+
+        Once, and capped, since the measurement extrapolates from a single
+        window — a handful of recent rows would otherwise project a read of
+        years.  A store with nothing older than the window pays for that
+        second read on every call, and there is no sound way to skip it: the
+        floor speaks for the source, and a store can run deeper than the
+        source now admits to.  Only the store can say what the store holds.
+        """
+        window = max(
+            math.ceil(count * self.bar_minutes / 1440) * self.LOOKBACK,
+            self.MIN_LOOKBACK_DAYS,
+        )
+        start_ts = end_ts - pd.Timedelta(days=window)
+        existing = self._read(symbol, (start_ts, end_ts), tz)
+        if not 0 < len(existing) < count:
+            return existing
+
+        held_days = max((end_ts - existing.index[0]).days, 1)
+        widen = min(
+            math.ceil(held_days * count / len(existing)), window * self.MAX_WIDEN
+        )
+        if widen <= window:  # never narrow the window
+            return existing
+        # Speculative, so it may only add.  A read that errors reports an empty
+        # frame, and taking that would turn a live cache into a miss.
+        wider = self._read(symbol, (end_ts - pd.Timedelta(days=widen), end_ts), tz)
+        return wider if len(wider) > len(existing) else existing
+
     def _do_get(self, symbol: str, end_ts: pd.Timestamp, count: int) -> pd.DataFrame:
         tz = self._get_tz(symbol)
-        if self.is_daily:
-            start_ts = end_ts - pd.Timedelta(days=count * self.LOOKBACK)
-        else:
-            cal_days = math.ceil(count * self.bar_minutes / 1440) * self.LOOKBACK
-            start_ts = end_ts - pd.Timedelta(days=max(cal_days, self.MIN_LOOKBACK_DAYS))
-        existing = self._read(symbol, (start_ts, end_ts), tz)
-
-        def trim(df: pd.DataFrame) -> pd.DataFrame:
-            return _trim(df, end_ts, count)
+        existing = self._read_window(symbol, end_ts, count, tz)
 
         def merge(*dfs: pd.DataFrame) -> pd.DataFrame:
-            return trim(_normalize(pd.concat(dfs), tz))
+            return _trim(_normalize(pd.concat(dfs), tz), end_ts, count)
 
         def full_fetch() -> pd.DataFrame:
             """Fetch the whole window and offer it to the store.
 
-            What comes back goes to the caller as it is.  The source is
-            authoritative — if it cannot supply the span, no one downstream
-            can, and a cache that withheld the frame would leave the caller
-            with nothing rather than with less.  Whether it is also *stored*
-            is a separate question, and ``_store``'s.
+            What comes back goes to the caller as it is, unless nothing came
+            back — an empty answer replaces nothing, so the cached rows still
+            serve.  Otherwise the source is authoritative: if it cannot supply
+            the span, no one downstream can, and a cache that withheld the
+            frame would leave the caller with nothing rather than with less.
+            Whether it is also *stored* is a separate question, and
+            ``_store``'s.
             """
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             self._store(symbol, df)
@@ -358,13 +414,14 @@ class IncrCache:
 
         # Cache miss.  A read error also lands here (``_read`` reports an
         # empty frame), so the symbol may well hold rows this fetch would
-        # replace — `_store` is what tells those two apart.
+        # replace — the write guard is all that stands between them, and only
+        # for the holes a supplied ``is_holey`` can see.
         if existing.empty:
             log.info("miss %s, fetching %d bars", symbol, count)
-            return trim(full_fetch())
+            return _trim(full_fetch(), end_ts, count)
 
         last = existing.index[-1]
-        trimmed = trim(existing)
+        trimmed = _trim(existing, end_ts, count)
 
         # A hole in the stored window.  No frame written here contained it:
         # the rows predate the hook, came from another writer, survived a

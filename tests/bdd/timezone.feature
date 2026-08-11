@@ -1,15 +1,19 @@
-Feature: Timezone handling
-  Data is stored in the configured timezone; queries convert parameters accordingly.
+Feature: Timezone
+  Data is stored and returned in the symbol's configured market timezone,
+  whatever timezone the source reports in.
 
-  Scenario: Store localizes naive data to configured timezone
-    Given an empty ArcticDB library
-    And an upstream source with 60 minute bars from "2024-01-15 09:30"
-    When I request 30 bars for "S" ending "2024-01-15 10:30" with timezone "America/New_York"
-    Then the stored data has timezone "America/New_York"
+  Scenario: A fetched frame is converted to the market timezone
+    Given a market timezone of "America/New_York"
+    And minute bars
+    And an empty store
+    And an upstream source reporting 60 minute bars in UTC from "2024-01-15 09:30"
+    When I request 30 bars for "S" ending "2024-01-15 10:30"
+    Then the written frame is in "America/New_York"
 
-  Scenario: Read returns tz-aware data in configured timezone
-    Given an ArcticDB library with 60 tz-aware minute bars in "America/New_York" from "2024-01-15 09:30"
+  Scenario: A stored frame is returned in the market timezone
+    Given a market timezone of "America/New_York"
+    And minute bars
+    And a store holding 60 minute bars in "America/New_York" from "2024-01-15 09:30"
     And an upstream source with no data
-    When I request 30 bars for "S" ending "2024-01-15 10:30" with timezone "America/New_York"
-    Then the result has timezone "America/New_York"
-    And the result timestamps are in New York wall-clock time
+    When I request 30 bars for "S" ending "2024-01-15 10:30"
+    Then the result is in "America/New_York"
