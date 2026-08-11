@@ -528,20 +528,22 @@ class TestContinuity:
         cache._fetch.assert_not_called()  # type: ignore[union-attr]
         assert len(result) == 10
 
-    def test_hole_triggers_refetch(self, lib):
-        """Window spans 14 expected bars but holds 10 → full re-fetch."""
+    def test_a_hole_in_the_cache_is_refetched(self, lib):
+        """A hole is the one thing the store cannot answer for itself.
+
+        Written frames pass the hook, so rows like these predate it or came
+        from another writer.  Only the source can say what belongs in the
+        gap, so it is asked, and what it sends back replaces the window.
+        """
         lib.has_symbol.return_value = True
         lib.read.return_value.data = _holey_df()
 
-        full = _daily_df("2024-01-01", 14)
-        cache = _make_cache(lib, full, is_holey=_gapless)
+        cache = _make_cache(lib, _daily_df("2024-01-01", 14), is_holey=_gapless)
         result = cache.get("S", end=datetime.date(2024, 1, 14), count=10)
 
         cache._fetch.assert_called_once()  # type: ignore[union-attr]
-        _, _, call_count = cache._fetch.call_args[0]  # type: ignore[union-attr]
-        assert call_count == 10  # full window, not gap
-        lib.update.assert_called_once()
-        assert pd.Timestamp("2024-01-05", tz=_UTC) in result.index
+        assert len(result) == 10
+        assert pd.Timestamp("2024-01-05", tz=_UTC) in result.index  # gap filled
 
     def test_short_frames_never_reach_the_hook(self):
         """Under 2 bars there is no interior to miss.  Hooks index
@@ -556,195 +558,32 @@ class TestContinuity:
         assert not cache._has_hole("S", _daily_df("2024-01-01", 1))
 
     def test_slack_is_the_hooks_business(self, lib):
-        """Same 4 missing days, a hook that tolerates 5 → no re-fetch.  The
-        cache holds no tolerance of its own; the verdict is the hook's."""
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
+        """Same 4 missing days, a hook that tolerates 5 → written.
 
-        cache = _make_cache(lib, is_holey=lambda _, df: len(df) < _span_days(df) - 5)
-        result = cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        cache._fetch.assert_not_called()  # type: ignore[union-attr]
-        assert len(result) == 10
-
-    def test_refetch_still_holey_returns_existing_unstored(self, lib):
-        """Source has the same hole → return existing, never store: update
-        replaces the whole span, a gappy frame would delete good rows."""
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
-        result = cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        cache._fetch.assert_called_once()  # type: ignore[union-attr]
-        assert len(result) == 10
-        lib.update.assert_not_called()
-
-
-class TestRepairCooldown:
-    """A full-window fetch that comes back unusable is not repeated on the
-    next read.
-
-    Some holes cannot be mended — the source simply does not have those bars
-    any more.  Without a cooldown that verdict is re-litigated on every single
-    read, and since the frame is never storable, it never converges: one
-    full-window fetch per read, forever.
-    """
-
-    def test_an_unmendable_frame_is_refetched_once(self, lib):
-        """The source carries the same hole, so no repair can ever land."""
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
-        for _ in range(3):
-            cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        cache._fetch.assert_called_once()  # type: ignore[union-attr]
-        lib.update.assert_not_called()
-
-    def test_a_frame_both_holey_and_short_stops_asking_twice(self, lib):
-        """The shape seen in production: 10 bars against a 14-bar ask, with a
-        hole in them.  The short branch asks the very same full window the
-        repair just did, so it has to respect the same cooldown."""
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
-        for _ in range(3):
-            cache.get("S", end=datetime.date(2024, 1, 14), count=14)
-
-        cache._fetch.assert_called_once()  # type: ignore[union-attr]
-
-    def test_the_tail_still_advances_while_cooling(self, lib):
-        """Cooling must not freeze the symbol.  The ancient hole is beyond
-        repair, but today's bar still has to land — so the repair falls
-        through to the ordinary path instead of returning from it."""
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _make_cache(lib, is_holey=_gapless)
-        cache._fetch.side_effect = [  # type: ignore[union-attr]
-            _holey_df(),  # the repair, unmendable
-            _daily_df("2024-01-14", 3, value_start=400),  # the stale gap
-        ]
-        cache.get("S", end=datetime.date(2024, 1, 16), count=10)
-
-        counts = [c[0][2] for c in cache._fetch.call_args_list]  # type: ignore[union-attr]
-        assert counts == [10, 3]  # one full window, then gap-sized
-        lib.update.assert_called_once()
-
-    def test_a_holey_first_write_is_stored(self, lib):
-        """With nothing in the store, the write guard has nothing to defend —
-        and refusing would be permanent, since the frame is never stored, so
-        every later read is another miss and another full-window fetch."""
-        lib.has_symbol.return_value = False  # nothing to overwrite
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
-        cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        lib.update.assert_called_once()
-
-    def test_the_verdict_matches_what_the_store_judges(self, lib):
-        """Decided on the frame ``_store`` writes, not the window served.
-
-        A source over-returning a holey prefix reads as a clean fetch when
-        only the delivered window is checked, and is refused at the store —
-        success by one measure, nothing written by the other, and a full
-        re-fetch on every read for as long as it lasts.
+        The cache holds no tolerance of its own; the verdict is the hook's.
         """
         lib.has_symbol.return_value = True
-        lib.read.return_value.data = pd.DataFrame()  # rows, outside this window
-        over_returned = pd.concat(
-            [
-                _daily_df("2024-01-01", 2),
-                _daily_df("2024-01-07", 2, value_start=200),  # Jan 3-6 missing
-                _daily_df("2024-01-09", 6, value_start=300),  # clean tail
-            ]
+        lib.read.return_value.data = _daily_df("2024-01-09", 6)  # short, clean
+
+        cache = _make_cache(
+            lib,
+            _holey_df(),  # 4 days missing
+            is_holey=lambda _, df: len(df) < _span_days(df) - 5,
+            spawn=lambda fn: fn(),
         )
-
-        cache = _make_cache(lib, over_returned, is_holey=_gapless)
-        cache.get("S", end=datetime.date(2024, 1, 14), count=6)
-
-        lib.update.assert_not_called()
-        assert cache._repair  # cooled, not banked as a success
-
-    def test_a_read_error_still_refuses(self, lib):
-        """``_read`` reports an unreadable symbol as an empty frame, so the
-        miss branch is also where a store outage lands.  Rows may well exist
-        outside the read window, and a holey write would land on top of them:
-        ``has_symbol``, not emptiness, is what says the store is untouched."""
-        lib.has_symbol.return_value = True
-        lib.read.side_effect = RuntimeError("store down")
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
         cache.get("S", end=datetime.date(2024, 1, 14), count=10)
 
-        lib.update.assert_not_called()
-
-    def test_one_depth_cooling_does_not_stall_another(self, lib):
-        """Callers ask the same cache for several window depths.  A holey
-        1000-bar window says nothing about a 10-bar one, so suppressing both
-        on one verdict would trade a fetch loop for a stall."""
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
-        cache.get("S", end=datetime.date(2024, 1, 14), count=14)
-        cache.get("S", end=datetime.date(2024, 1, 14), count=20)
-
-        assert cache._fetch.call_count == 2  # type: ignore[union-attr]
-
-    def test_a_clean_backfill_resets_the_ladder(self, lib):
-        """The ladder measures consecutive failure.  A recovery that lands
-        through the short branch has to clear it, or the next unrelated
-        failure starts at the rung this one reached."""
-
-        class _NoWait(IncrCache):
-            REPAIR_TTLS = (0,)
-
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _daily_df("2024-01-05", 6)  # clean, short
-
-        cache = _NoWait(
-            lib,
-            MagicMock(side_effect=[_holey_df(), _daily_df("2024-01-01", 10)]),
-            get_tz=lambda _: _UTC,
-            cache_ttl=0,
-            is_holey=_gapless,
-        )
-        cache.get("S", end=datetime.date(2024, 1, 10), count=10)
-        assert cache._repair  # the corrupt backfill cooled it
-
-        cache.get("S", end=datetime.date(2024, 1, 10), count=10)
-        assert cache._repair == {}
-
-    def test_the_cooldown_expires(self, lib):
-        """It paces the retry, it does not end it: a source that recovers has
-        to be re-probed, which is why the ladder caps instead of latching."""
-
-        class _NoWait(IncrCache):
-            REPAIR_TTLS = (0,)
-
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _NoWait(
-            lib,
-            MagicMock(return_value=_holey_df()),
-            get_tz=lambda _: _UTC,
-            cache_ttl=0,
-            is_holey=_gapless,
-        )
-        for _ in range(3):
-            cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        assert cache._fetch.call_count == 3  # type: ignore[union-attr]
+        lib.update.assert_called_once()  # tolerated, so stored
 
 
 class TestWriteGuard:
-    """`_store` is the integrity boundary: `update` replaces the frame's
-    whole span, so a holey frame is served but never written."""
+    """A holey frame is never written.
+
+    `update` replaces the frame's whole span, so writing one deletes cached
+    rows in its gaps — and storing it would only have the next read fetch the
+    window again.  The frame still reaches the caller: refusing a write never
+    drops data.
+    """
 
     def test_refuses_backfill_of_a_short_window(self, lib):
         lib.has_symbol.return_value = True
@@ -759,12 +598,8 @@ class TestWriteGuard:
 
     def test_refuses_hole_outside_the_delivered_window(self, lib):
         """The guard checks the frame being written, not the window being
-        served: a source over-returning holey history must not land on top of
-        rows already in the store.
-
-        ``has_symbol`` with an empty read is the shape that matters here —
-        rows exist, they just fall outside this window, so the delivered
-        window looking clean is no licence to write the rest.
+        served: a source over-returning holey history must not be stored just
+        because the slice the caller asked for came back clean.
         """
         lib.has_symbol.return_value = True
         lib.read.return_value.data = pd.DataFrame()
@@ -781,36 +616,14 @@ class TestWriteGuard:
         assert len(result) == 6  # the delivered window itself is clean
         lib.update.assert_not_called()
 
-    def test_refuses_gap_fetch_leaving_a_seam_hole(self, lib):
-        """The hole sits between the cached tail and the first new bar, so
-        the frame that would be written cannot show it — the gap fetch is
-        checked before the overlap row is deduplicated away."""
-        cached = _daily_df("2024-01-01", 10)  # ends Jan 10
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
+    def test_a_refused_backfill_still_floors_on_depth(self, lib):
+        """Four rows against a ten-bar ask is a statement about depth, and it
+        stays true whether or not the write policy accepts the frame.
 
-        gap = pd.concat(
-            [
-                cached.iloc[[-1]],  # Jan 10 overlap, unchanged
-                _daily_df("2024-01-13", 3, value_start=300),  # Jan 11-12 missing
-            ]
-        )
-        cache = _make_cache(lib, gap, is_holey=_gapless)
-        cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        assert cache._fetch.call_count == 2  # type: ignore[union-attr]  # full re-fetch
-        lib.update.assert_not_called()
-
-    def test_refused_backfill_leaves_no_floor(self, lib):
-        """A refused backfill is no evidence of how deep the source goes, so
-        it must not floor — a floor asserts the cache already reaches the
-        source's oldest bar, and this one asserts nothing of the kind.
-
-        It does cool off: the same full-window ask just came back unusable,
-        and asking again on the next read would only buy the same answer.
-        The two are not interchangeable.  A floor keyed to a depth the source
-        never claimed would go on answering for it; a cooldown expires and
-        re-probes.
+        This is also what terminates the branch: a refused write leaves the
+        window short, so without the floor the next read would put the
+        identical question to the source.  The floor's ladder still expires
+        and re-probes, so a source that deepens is found again.
         """
         lib.has_symbol.return_value = True
         lib.read.return_value.data = _daily_df("2024-01-05", 6)  # Jan 5-10
@@ -825,8 +638,23 @@ class TestWriteGuard:
         cache.get("S", end=datetime.date(2024, 1, 10), count=10)
         cache.get("S", end=datetime.date(2024, 1, 10), count=10)
 
-        assert cache._floor == {}
-        assert cache._fetch.call_count == 1  # type: ignore[union-attr]  # cooled
+        assert cache._floor  # depth recorded from the oldest bar offered
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+
+    def test_the_first_write_gets_no_exception(self, lib):
+        """An empty store is not a reason to admit a holey frame.
+
+        Storing it would buy one avoided miss and cost the invariant every
+        other path relies on — and buy it only until the next read, which
+        finds the hole and fetches the window anyway.
+        """
+        lib.has_symbol.return_value = False  # nothing to overwrite
+
+        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
+        result = cache.get("S", end=datetime.date(2024, 1, 14), count=10)
+
+        assert len(result) == 10  # still served
+        lib.update.assert_not_called()
 
     def test_incomplete_bar_exclusion_is_idempotent(self, lib):
         """The floor decision and the store must judge the same frame. Both
@@ -844,41 +672,35 @@ class TestWriteGuard:
         assert cache._complete("S", once).equals(once)
 
 
-class TestDiscontinuousFetchGate:
-    """Incremental fetch that skips the cached tail must not store a
-    fabricated mid-series hole."""
+class TestDiscontinuousGapFetch:
+    """A gap fetch that skips the cached tail is not upgraded on the spot.
 
-    def test_upgrades_to_full_refetch(self, lib):
+    Upgrading it there re-asked the source a question it had just answered.
+    The write guard cannot catch the seam either — the gap frame is
+    contiguous in itself, and the hole only appears once it lands beside the
+    cached tail.  The read side is what closes it, on the next read.
+    """
+
+    def test_the_seam_is_stored_then_found_on_the_next_read(self, lib):
         cached = _daily_df("2024-01-01", 10)  # ends Jan 10
         lib.has_symbol.return_value = True
         lib.read.return_value.data = cached
 
-        gap = _daily_df("2024-01-12", 4, value_start=200)  # skips Jan 10–11
-        full = _daily_df("2024-01-06", 10, value_start=300)
-        cache = _make_cache(lib)
-        cache._fetch.side_effect = [gap, full]  # type: ignore[union-attr]
+        gap = _daily_df("2024-01-12", 4, value_start=200)  # skips Jan 11
+        cache = _make_cache(lib, gap, is_holey=_gapless, spawn=lambda fn: fn())
+        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
+
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+        assert pd.Timestamp("2024-01-12", tz=_UTC) in result.index
+        stored = lib.update.call_args[0][1]
+        assert pd.Timestamp("2024-01-11", tz=_UTC) not in stored.index
+
+        # The seam is now interior to the store, where the read side sees it.
+        lib.read.return_value.data = pd.concat([cached, gap]).sort_index()
+        cache._fetch.return_value = _daily_df("2024-01-06", 10)  # type: ignore[union-attr]
         cache.get("S", end=datetime.date(2024, 1, 15), count=10)
 
         assert cache._fetch.call_count == 2  # type: ignore[union-attr]
-        _, _, call_count = cache._fetch.call_args[0]  # type: ignore[union-attr]
-        assert call_count == 10  # second fetch is the full window
-        lib.update.assert_called_once()
-        stored = lib.update.call_args[0][1]
-        assert pd.Timestamp("2024-01-11", tz=_UTC) in stored.index
-
-    def test_bad_refetch_serves_source_view_unstored(self, lib):
-        cached = _daily_df("2024-01-01", 10)
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
-
-        gap = _daily_df("2024-01-12", 4, value_start=200)
-        cache = _make_cache(lib)
-        cache._fetch.side_effect = [gap, pd.DataFrame()]  # type: ignore[union-attr]
-        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        lib.update.assert_not_called()
-        assert pd.Timestamp("2024-01-12", tz=_UTC) in result.index
-        assert len(result) == 10
 
 
 # ── invariant ────────────────────────────────────────────────────
