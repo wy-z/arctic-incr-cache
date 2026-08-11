@@ -1,8 +1,10 @@
-Feature: Incomplete bar exclusion
-  Bars that may still be updating are excluded from storage.
+Feature: Incomplete bars
+  A bar that may still be updating is served but never stored — stored, it
+  would sit there half-formed and shadow the finalised bar that follows.
 
-  Scenario: Today's bar is excluded from daily storage
-    Given an empty ArcticDB library
+  Scenario: Today is served but not stored
+    Given an empty store
     And an upstream source with 15 daily bars ending today
     When I request 10 bars for "S" with no end date
-    Then the stored data does not include today
+    Then the result contains today
+    And the store does not hold today

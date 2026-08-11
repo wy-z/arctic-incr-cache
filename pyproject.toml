@@ -38,7 +38,6 @@ dev = [
     "pytest>=8.3.3",
     "ruff>=0.6.4",
     "isort>=5.13.2",
-    "pytest-mock>=3.14.0",
     "pyright>=1.1.407",
     "pandas-stubs>=2.3.3.251219",
     "pytest-bdd>=8.1.0",

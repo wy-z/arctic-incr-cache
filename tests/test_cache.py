@@ -5,6 +5,7 @@ import random
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -24,6 +25,23 @@ def _daily_df(start, n, value_start=100):
 def _intraday_df(start, n):
     times = pd.date_range(start=start, periods=n, freq="1min", tz=_UTC)
     return pd.DataFrame({"price": range(n)}, index=times)
+
+
+def _sessions(days, per_day):
+    """*days* trading sessions of *per_day* minute bars, from 09:30."""
+    return pd.concat(
+        [
+            _intraday_df(day + pd.Timedelta(hours=9, minutes=30), per_day)
+            for day in pd.bdate_range("2024-01-01", periods=days, tz=_UTC)
+        ]
+    )
+
+
+def _windowed_read(df):
+    """A ``lib.read`` that honours ``date_range``, as ArcticDB does."""
+    return lambda _symbol, date_range: MagicMock(
+        data=df.loc[(df.index >= date_range[0]) & (df.index <= date_range[1])]
+    )
 
 
 def _span_days(df):
@@ -58,38 +76,10 @@ def lib():
     return mock
 
 
-# ── cache miss ───────────────────────────────────────────────────
+# ── short window / source depth ──────────────────────────────────
 
 
-class TestCacheMiss:
-    def test_fetches_and_stores(self, lib):
-        cache = _make_cache(lib, _daily_df("2024-01-01", 15))
-        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        assert len(result) == 10
-        lib.update.assert_called_once()
-
-    def test_empty_source(self, lib):
-        cache = _make_cache(lib)
-        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        assert result.empty
-        lib.update.assert_not_called()
-
-
-# ── cache hit ────────────────────────────────────────────────────
-
-
-class TestCacheHit:
-    def test_fresh_cache_skips_fetch(self, lib):
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _daily_df("2024-01-01", 20)
-
-        cache = _make_cache(lib)
-        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        assert len(result) == 10
-
+class TestShortWindow:
     def test_fresh_but_short_fetches_more(self, lib):
         """When cache is fresh but has fewer rows than count, fetch to fill."""
         lib.has_symbol.return_value = True
@@ -101,20 +91,6 @@ class TestCacheHit:
         result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
 
         assert len(result) == 10
-        cache._fetch.assert_called_once()  # type: ignore[union-attr]
-
-    def test_short_floor_suppresses_refetch(self, lib):
-        """When source has no more data, record oldest date and skip re-fetch."""
-        lib.has_symbol.return_value = True
-        # Cache has 5 rows — source also only has 5 rows (can't fill to 10)
-        cached = _daily_df("2024-01-11", 5)
-        lib.read.return_value.data = cached
-
-        cache = _make_cache(lib, cached)  # fetch returns same data
-        cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-        cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        # Should only fetch once — second call sees floor covers existing
         cache._fetch.assert_called_once()  # type: ignore[union-attr]
 
     def test_floor_still_fills_stale_right_edge(self, lib):
@@ -160,50 +136,6 @@ class TestCacheHit:
 
 
 class TestIncrementalUpdate:
-    def test_merges_new_data(self, lib):
-        cached = _daily_df("2024-01-01", 10)
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
-
-        new = _daily_df("2024-01-11", 10, value_start=200)
-        cache = _make_cache(lib, new)
-        result = cache.get("S", end=datetime.date(2024, 1, 20), count=10)
-
-        assert len(result) == 10
-        lib.update.assert_called_once()
-        fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
-        _, _, call_count = fetch_mock.call_args[0]
-        assert call_count == 10
-
-    def test_deduplicates_unchanged_overlap(self, lib):
-        cached = _daily_df("2024-01-01", 10)
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
-
-        overlap = cached.iloc[[-1]]  # Jan 10, same value
-        new_part = _daily_df("2024-01-11", 5, value_start=500)
-        cache = _make_cache(lib, pd.concat([overlap, new_part]))
-        cache.get("S", end=datetime.date(2024, 1, 20), count=10)
-
-        stored = lib.update.call_args[0][1]
-        assert pd.Timestamp("2024-01-10", tz=_UTC) not in stored.index
-
-    def test_keeps_changed_overlap(self, lib):
-        cached = _daily_df("2024-01-01", 10)
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
-
-        changed = pd.DataFrame(
-            {"value": [999]},
-            index=pd.DatetimeIndex([pd.Timestamp("2024-01-10", tz=_UTC)]),
-        )
-        new_part = _daily_df("2024-01-11", 5, value_start=500)
-        cache = _make_cache(lib, pd.concat([changed, new_part]))
-        cache.get("S", end=datetime.date(2024, 1, 20), count=10)
-
-        stored = lib.update.call_args[0][1]
-        assert pd.Timestamp("2024-01-10", tz=_UTC) in stored.index
-
     def test_daily_gap_across_dst_spring_forward(self, lib):
         """Gap calculation uses calendar days, not timedelta, to avoid DST errors."""
         # 2024-03-10 is US spring forward — midnight-to-midnight is only 23h
@@ -224,65 +156,134 @@ class TestIncrementalUpdate:
         _, _, call_count = fetch_mock.call_args[0]
         assert call_count == 4  # Mar 9 (overlap) + Mar 10, 11, 12
 
-    def test_empty_source_returns_existing(self, lib):
-        cached = _daily_df("2024-01-01", 10)
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
 
-        cache = _make_cache(lib)
-        result = cache.get("S", end=datetime.date(2024, 1, 20), count=10)
-
-        assert len(result) == 10
-        lib.update.assert_not_called()
+# ── bar alignment ────────────────────────────────────────────────
 
 
-# ── incomplete bar exclusion ─────────────────────────────────────
+class TestBarAlignment:
+    """A clock change makes a wall-clock hour ambiguous or impossible, and
+    flooring reads wall clock."""
 
+    @pytest.mark.parametrize(
+        ("fold", "expected"),
+        [(0, "2024-11-03 01:00:00-04:00"), (1, "2024-11-03 01:00:00-05:00")],
+    )
+    def test_a_repeated_hour_keeps_its_side(self, lib, fold, expected):
+        cache = _make_cache(lib, bar_minutes=60, get_tz=lambda _: _NY)
+        end = datetime.datetime(2024, 11, 3, 1, 30, tzinfo=_NY, fold=fold)
 
-class TestIncompleteBarExclusion:
-    def test_today_excluded_from_daily_storage(self, lib):
-        today_utc = pd.Timestamp.now(_UTC).normalize()
-        start = (today_utc - pd.Timedelta(days=14)).date()
-        df = _daily_df(start, 15)
-        cache = _make_cache(lib, df)
-        cache.get("S", count=10)
+        aligned = cache._align_bar(cache._resolve_end(end, _NY))
 
-        stored = lib.update.call_args[0][1]
-        assert stored.index[-1] < today_utc
+        assert str(aligned) == expected
+
+    def test_a_boundary_in_a_repeated_hour_takes_the_later_instant(self, lib):
+        """A 90-minute bar puts the boundary at 01:30, which happens twice,
+        while the ask at 02:10 is past both.  Taking the first would cut an
+        hour off a window the caller asked for."""
+        cache = _make_cache(lib, bar_minutes=90, get_tz=lambda _: _NY)
+        end = datetime.datetime(2024, 11, 3, 2, 10, tzinfo=_NY)
+
+        aligned = cache._align_bar(cache._resolve_end(end, _NY))
+
+        assert aligned == pd.Timestamp("2024-11-03 06:30", tz=_UTC)
+
+    def test_an_offset_change_without_dst_keeps_its_side(self, lib):
+        """Moscow left DST in 2014 by moving the offset, so both sides of the
+        repeated hour report ``dst() == 0`` and a DST test cannot separate
+        them.  The ask is the earlier side, and must stay there."""
+        tz = ZoneInfo("Europe/Moscow")
+        cache = _make_cache(lib, bar_minutes=60, get_tz=lambda _: tz)
+        end = datetime.datetime(2014, 10, 26, 1, 30, tzinfo=tz, fold=0)
+
+        aligned = cache._align_bar(cache._resolve_end(end, tz))
+
+        assert str(aligned) == "2014-10-26 01:00:00+04:00"
+
+    @pytest.mark.parametrize(
+        ("zone", "day", "expected"),
+        [
+            # Midnight happens twice: the day's own bar carries the first
+            # stamp, and the second is still that day.
+            ("America/Havana", (2024, 11, 3), "2024-11-03 00:00:00-05:00"),
+            # Midnight never happens: the day starts an hour late.
+            ("America/Santiago", (2024, 9, 8), "2024-09-08 01:00:00-03:00"),
+        ],
+    )
+    def test_a_daily_boundary_on_a_midnight_change(self, lib, zone, day, expected):
+        tz = ZoneInfo(zone)
+        cache = _make_cache(lib, get_tz=lambda _, t=tz: t)
+
+        aligned = cache._align_bar(cache._resolve_end(datetime.date(*day), tz))
+
+        assert str(aligned) == expected
+
+    def test_a_skipped_boundary_never_aligns_past_the_ask(self, lib):
+        """Lord Howe shifts by 30 minutes, so an hourly boundary lands inside
+        the skipped half-hour and shifting it forward overshoots the ask."""
+        tz = ZoneInfo("Australia/Lord_Howe")
+        cache = _make_cache(lib, bar_minutes=60, get_tz=lambda _: tz)
+        end = datetime.datetime(2024, 10, 6, 2, 31, tzinfo=tz)
+
+        aligned = cache._align_bar(cache._resolve_end(end, tz))
+
+        assert aligned == pd.Timestamp("2024-10-05 15:31", tz="UTC")
+
+    def test_todays_bar_stays_incomplete_through_a_repeated_midnight(self, lib):
+        """Havana's midnight happens twice.  Today's bar carries the first
+        stamp, so a cutoff that follows the clock into the second hour would
+        admit a bar that is still updating."""
+        tz = ZoneInfo("America/Havana")
+        first_midnight = pd.Timestamp("2024-11-03 04:00", tz="UTC").tz_convert(tz)
+        second_hour = pd.Timestamp("2024-11-03 05:30", tz="UTC").tz_convert(tz)
+        cache = _make_cache(lib, get_tz=lambda _: tz)
+
+        with patch(
+            "arctic_incr_cache.cache.pd.Timestamp.now",
+            side_effect=lambda _tz: second_hour,
+        ):
+            assert cache._incomplete_threshold(tz) == first_midnight
 
 
 # ── intraday ─────────────────────────────────────────────────────
 
 
 class TestIntraday:
-    def test_cache_miss(self, lib):
-        df = _intraday_df("2024-01-15 09:30", 360)
-        cache = _make_cache(lib, df, bar_minutes=1, default_count=1950)
-        end = datetime.datetime(2024, 1, 15, 15, 30, tzinfo=_UTC)
-        result = cache.get("S", end=end, count=100)
-
-        assert len(result) == 100
-        lib.update.assert_called_once()
-
-    def test_large_gap_fetches_full_window(self, lib):
-        """Gap wider than count → full-window fetch, not a gap fill.
-
-        The cache holds enough rows to skip the short branch, so this
-        reaches the incremental branch and truncates there.
-        """
-        cached = _intraday_df("2024-01-12 09:30", 150)  # ends 11:59
+    def test_a_short_session_widens_the_read_instead_of_refetching(self, lib):
+        """The read window is elapsed time and a session is a fraction of a
+        day, so an ask spanning several sessions comes up short against a
+        store holding every bar of it.  Without the widened re-read that is a
+        full-window fetch on every read, forever."""
+        sessions = _sessions(15, 240)
         lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
+        lib.read.side_effect = _windowed_read(sessions)
 
-        fresh = _intraday_df("2024-01-15 09:30", 360)
-        cache = _make_cache(lib, fresh, bar_minutes=1, default_count=1950)
-        end = datetime.datetime(2024, 1, 15, 15, 30, tzinfo=_UTC)
-        result = cache.get("S", end=end, count=100)
+        cache = _make_cache(lib, bar_minutes=1)
+        result = cache.get("S", end=sessions.index[-1].to_pydatetime(), count=1950)
 
-        assert len(result) == 100
-        fetch_mock: MagicMock = cache._fetch  # type: ignore[assignment]
-        _, _, call_count = fetch_mock.call_args[0]
-        assert call_count == 100  # min(gap_count, count), gap is far wider
+        assert len(result) == 1950
+        cache._fetch.assert_not_called()  # type: ignore[union-attr]
+
+    def test_a_failed_widening_keeps_the_rows_already_read(self, lib):
+        """The widened read is speculative, and ``_read`` reports an error as
+        an empty frame — which, taken at face value, turns a live cache into
+        a miss."""
+        sessions = _sessions(15, 240)
+        windowed, reads = _windowed_read(sessions), []
+
+        def flaky(symbol, date_range):
+            reads.append(date_range)
+            if len(reads) > 1:
+                raise RuntimeError("segment unavailable")
+            return windowed(symbol, date_range)
+
+        lib.has_symbol.return_value = True
+        lib.read.side_effect = flaky
+
+        cache = _make_cache(lib, bar_minutes=1)
+        result = cache.get("S", end=sessions.index[-1].to_pydatetime(), count=1950)
+
+        assert len(reads) == 2  # the widening was attempted
+        assert not result.empty  # and what the first read found still serves
 
     def test_gap_count_uses_minute_resolution(self, lib):
         cached = _intraday_df("2024-01-15 03:40", 500)  # ends at 11:59
@@ -330,36 +331,6 @@ class TestIntraday:
         start_ts, end_ts = lib.read.call_args.kwargs["date_range"]
         assert end_ts == pd.Timestamp(end)
         assert start_ts <= pd.Timestamp("2024-01-11 09:30", tz=_UTC)
-
-
-# ── timezone end-to-end ───────────────────────────────────────────
-
-
-class TestTimezoneEndToEnd:
-    def test_store_localizes_to_configured_tz(self, lib):
-        df = _intraday_df("2024-01-15 09:30", 60)
-        cache = _make_cache(
-            lib, df, bar_minutes=1, default_count=1950, get_tz=lambda _: _NY
-        )
-        end = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=_UTC)
-        cache.get("S", end=end, count=30)
-
-        stored = lib.update.call_args[0][1]
-        assert str(pd.DatetimeIndex(stored.index).tz) == "America/New_York"
-
-    def test_read_returns_tz_aware_in_configured_tz(self, lib):
-        raw = _intraday_df("2024-01-15 09:30", 60)
-        raw.index = pd.DatetimeIndex(raw.index).tz_convert(_NY)
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = raw
-
-        cache = _make_cache(
-            lib, bar_minutes=1, default_count=1950, get_tz=lambda _: _NY
-        )
-        end = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=_UTC)
-        result = cache.get("S", end=end, count=30)
-
-        assert str(pd.DatetimeIndex(result.index).tz) == "America/New_York"
 
 
 # ── normalize ────────────────────────────────────────────────────
@@ -448,6 +419,17 @@ class TestTrim:
         result = _trim(pd.DataFrame(), pd.Timestamp("2024-01-10"), 10)
         assert result.empty
 
+    def test_the_result_does_not_pin_the_frame_it_came_from(self):
+        """A tail is a view.  This one is what the result cache holds, so a
+        hundred rows would keep the whole window they were cut from alive."""
+        from arctic_incr_cache.cache import _trim
+
+        window = _intraday_df("2024-01-01 09:30", 10_000)
+        result = _trim(window, window.index[-1], 100)
+
+        held = np.asarray(result["price"])
+        assert held.base is None or held.base.nbytes <= held.nbytes
+
 
 # ── end_ts ───────────────────────────────────────────────────────
 
@@ -457,6 +439,16 @@ class TestResolveEnd:
         cache = _make_cache(MagicMock())
         result = cache._resolve_end(datetime.date(2024, 1, 15), tz=_UTC)
         assert result == pd.Timestamp("2024-01-15 23:59:59.999999", tz=_UTC)
+
+    def test_date_end_takes_the_last_instant_of_a_stretched_day(self):
+        """Cairo ends DST at midnight, so its last hour happens twice.  End of
+        day is the second one — the first drops an hour of bars."""
+        tz = ZoneInfo("Africa/Cairo")
+        cache = _make_cache(MagicMock(), get_tz=lambda _: tz)
+
+        end = cache._resolve_end(datetime.date(2024, 10, 31), tz)
+
+        assert end == pd.Timestamp("2024-10-31 21:59:59.999999", tz=_UTC)
 
     def test_naive_datetime_localized_as_local(self):
         cache = _make_cache(MagicMock())
@@ -527,23 +519,6 @@ class TestContinuity:
 
         cache._fetch.assert_not_called()  # type: ignore[union-attr]
         assert len(result) == 10
-
-    def test_a_hole_in_the_cache_is_refetched(self, lib):
-        """A hole is the one thing the store cannot answer for itself.
-
-        Written frames pass the hook, so rows like these predate it or came
-        from another writer.  Only the source can say what belongs in the
-        gap, so it is asked, and what it sends back replaces the window.
-        """
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = _holey_df()
-
-        cache = _make_cache(lib, _daily_df("2024-01-01", 14), is_holey=_gapless)
-        result = cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        cache._fetch.assert_called_once()  # type: ignore[union-attr]
-        assert len(result) == 10
-        assert pd.Timestamp("2024-01-05", tz=_UTC) in result.index  # gap filled
 
     def test_short_frames_never_reach_the_hook(self):
         """Under 2 bars there is no interior to miss.  Hooks index
@@ -641,66 +616,17 @@ class TestWriteGuard:
         assert cache._floor  # depth recorded from the oldest bar offered
         cache._fetch.assert_called_once()  # type: ignore[union-attr]
 
-    def test_the_first_write_gets_no_exception(self, lib):
-        """An empty store is not a reason to admit a holey frame.
-
-        Storing it would buy one avoided miss and cost the invariant every
-        other path relies on — and buy it only until the next read, which
-        finds the hole and fetches the window anyway.
-        """
-        lib.has_symbol.return_value = False  # nothing to overwrite
-
-        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
-        result = cache.get("S", end=datetime.date(2024, 1, 14), count=10)
-
-        assert len(result) == 10  # still served
-        lib.update.assert_not_called()
-
-    def test_incomplete_bar_exclusion_is_idempotent(self, lib):
-        """The floor decision and the store must judge the same frame. Both
-        run the exclusion, so a second pass must not eat a complete bar and
-        make them disagree at an exact bar boundary."""
-        cache = _make_cache(lib, bar_minutes=1)
-        # A bar landing exactly on the threshold is the boundary case: it
-        # counts as incomplete, so a naive "drop the last row" repeats.
+    def test_the_bar_on_the_threshold_is_incomplete(self, lib):
+        """The cutoff is strict: a bar landing exactly on the threshold may
+        still be updating, so the write path drops it."""
+        cache = _make_cache(lib, bar_minutes=1, spawn=lambda fn: fn())
         threshold = pd.Timestamp("2024-01-15 10:30", tz=_UTC)
-        cache._incomplete_threshold = lambda _tz: threshold  # type: ignore[method-assign]
-        df = _intraday_df("2024-01-15 10:28", 4)  # 10:28..10:31
+        cache._incomplete_threshold = lambda *_: threshold  # type: ignore[method-assign]
 
-        once = cache._complete("S", df)
-        assert once.index[-1] == pd.Timestamp("2024-01-15 10:29", tz=_UTC)
-        assert cache._complete("S", once).equals(once)
+        cache._store("S", _intraday_df("2024-01-15 10:28", 4))  # 10:28..10:31
 
-
-class TestDiscontinuousGapFetch:
-    """A gap fetch that skips the cached tail is not upgraded on the spot.
-
-    Upgrading it there re-asked the source a question it had just answered.
-    The write guard cannot catch the seam either — the gap frame is
-    contiguous in itself, and the hole only appears once it lands beside the
-    cached tail.  The read side is what closes it, on the next read.
-    """
-
-    def test_the_seam_is_stored_then_found_on_the_next_read(self, lib):
-        cached = _daily_df("2024-01-01", 10)  # ends Jan 10
-        lib.has_symbol.return_value = True
-        lib.read.return_value.data = cached
-
-        gap = _daily_df("2024-01-12", 4, value_start=200)  # skips Jan 11
-        cache = _make_cache(lib, gap, is_holey=_gapless, spawn=lambda fn: fn())
-        result = cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        cache._fetch.assert_called_once()  # type: ignore[union-attr]
-        assert pd.Timestamp("2024-01-12", tz=_UTC) in result.index
         stored = lib.update.call_args[0][1]
-        assert pd.Timestamp("2024-01-11", tz=_UTC) not in stored.index
-
-        # The seam is now interior to the store, where the read side sees it.
-        lib.read.return_value.data = pd.concat([cached, gap]).sort_index()
-        cache._fetch.return_value = _daily_df("2024-01-06", 10)  # type: ignore[union-attr]
-        cache.get("S", end=datetime.date(2024, 1, 15), count=10)
-
-        assert cache._fetch.call_count == 2  # type: ignore[union-attr]
+        assert stored.index[-1] == pd.Timestamp("2024-01-15 10:29", tz=_UTC)
 
 
 # ── invariant ────────────────────────────────────────────────────

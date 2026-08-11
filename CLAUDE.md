@@ -11,7 +11,8 @@ ArcticDB-backed time series cache with incremental updates. First call fetches t
 ```bash
 uv sync --group dev          # install dependencies
 uv run pytest                # run all tests
-uv run pytest tests/test_cache.py::TestCacheMiss::test_fetches_and_stores  # single test
+uv run pytest tests/test_cache.py::TestWriteGuard  # one class
+uv run pytest tests/bdd                            # the behaviour scenarios
 uv run ruff check src/ tests/       # lint
 uv run ruff format --check src/ tests/  # format check
 ```
@@ -22,9 +23,11 @@ Single-module library: `src/arctic_incr_cache/cache.py`.
 
 **`IncrCache`** — the only public class. Instantiated with an ArcticDB library and a `fetch` callable. No global state, no abstract base class.
 
+Tests split by layer, one behaviour one home: `tests/bdd/` states the cache's rules as scenarios driven against an in-memory store that mimics ArcticDB `update` (span replacement), so rules that only show across two reads — a floor, a seam, a hole — read as one scenario. `tests/test_cache.py` keeps the pure helpers, branch mechanics, and the no-holey-write invariant, driven with mocks.
+
 ### Cache flow (`get()`)
 
-1. Read existing data from ArcticDB for the symbol
+1. Read existing data from ArcticDB for the symbol, over a window sized from elapsed bar time. Sessions and holidays make bars sparser than that, so a read that lands short of the ask is retried once, widened by the density it just measured — the store usually holds the rest just outside the window, and asking it again is far cheaper than asking the source
 2. **Miss** — nothing read: call `fetch()` and offer it to `_store()`. A read error reports an empty frame too (`_read` swallows it), so the symbol may hold rows the fetch would replace
 3. **Holey** — the stored window fails `is_holey`: full fetch, offered to `_store()`, merged over the stored rows
 4. **Short** — fewer rows than requested and no valid floor: full fetch, offered to `_store()`, and the floor recorded when the source stays short
@@ -53,11 +56,12 @@ When `get_tz` returns a timezone for a symbol:
 ### Continuity model
 
 `is_holey(symbol, df)` buys **one invariant: every frame this cache writes
-passes it, and every stored window it reads is checked.** Not "the store is
-clean" — a hole another writer left survives a re-fetch that carries the same
-hole, since the refused write leaves the old rows where they are, and a hole
-can open at the seam between two contiguous writes without either frame
-failing the hook.
+passes it, and every window it serves from the store is checked.** Not "the
+store is clean" — a hole another writer left survives a re-fetch that carries
+the same hole, since the refused write leaves the old rows where they are, and
+a hole can open at the seam between two contiguous writes without either frame
+failing the hook. Not the whole read either: the window read can be wider than
+the ask, and the hook grades the ask.
 `_has_hole()` guards the hook with the 2-bar minimum — a shorter frame has no
 interior — and otherwise delegates the whole verdict, slack included; the
 cache owns no tolerance of its own.

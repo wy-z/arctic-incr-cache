@@ -101,11 +101,12 @@ notice the absence, at both ends of the store, once you say what "complete"
 means for your data.
 
 Supply `is_holey` and you get one invariant: **every frame this cache writes
-passes it, and every stored window it reads is checked.** Not that the store
-is clean — a hole another writer left outlives a re-fetch carrying the same
-hole, because refusing that write leaves the old rows where they are, and a
-hole can open at the seam between two contiguous writes without either frame
-failing the hook.
+passes it, and every window it serves from the store is checked.** Not that
+the store is clean — a hole another writer left outlives a re-fetch carrying
+the same hole, because refusing that write leaves the old rows where they are,
+and a hole can open at the seam between two contiguous writes without either
+frame failing the hook. Nor that the store is checked beyond what is served:
+the read may pull more rows than the ask, and the hook grades the ask.
 
 - **On write** — a holey frame is refused. Storing it would buy nothing (the
   next read finds the hole and fetches the window again) and cost plenty:
@@ -197,6 +198,8 @@ all — raises `ValueError` before the frame can be stored.
 | `default_count` | no | Bars returned when `count` is omitted (default 252) |
 | `spawn` | no | Fire-and-forget callable for async writes (default: daemon thread) |
 | `lock_class` | no | Lock constructor (default: `threading.Lock`) |
+| `floor` | no | Shared dict holding each symbol's known source depth, so a short window isn't re-fetched forever. Pass one to share it across instances — keys are bare symbols, so give every library / bar width its own dict |
+| `cache_ttl` | no | Result TTL in seconds (default 60); repeated `get()` calls with the same resolved parameters reuse the result. `0` disables |
 
 ## License
 
