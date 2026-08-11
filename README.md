@@ -7,6 +7,26 @@ ArcticDB.  Subsequent calls only fetch the gap between the cached tail and
 the requested end — then merge and upsert.  Incomplete (still-updating) bars
 are automatically excluded from storage so they never overwrite finalised data.
 
+## What it guarantees
+
+One hook — `is_holey` — consulted at both ends of the store, plus one rule
+about what reaches you:
+
+- **On read** — every window served from the store is graded, and a failing one
+  is re-fetched. Not that the store is clean, and continuity is all that is
+  graded.
+- **On write** — only frames that pass are stored: `update` replaces a frame's
+  whole span, so a holey write deletes the cached rows inside its gaps.
+- **On return** — whatever `fetch` returns reaches you as it is, holey or not.
+  The cache has no higher court to appeal to; it can only ask again, and the
+  source has already answered. An empty answer is the exception — it replaces
+  nothing, so the cached rows go on serving.
+
+Serving and persisting are separate verdicts: a refused write never withholds
+the frame, and a served frame is not a claim that it is fit to use.
+[Continuity](#continuity) and [Storage semantics](#storage-semantics) carry the
+detail.
+
 ## Install
 
 ```bash
