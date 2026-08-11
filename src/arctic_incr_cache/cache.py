@@ -95,6 +95,7 @@ class IncrCache:
     """
 
     FLOOR_TTLS = (360, 720, 1440)  # 6/12/24 min backoff, capped at the last
+    REPAIR_TTLS = (600, 3600, 60 * 60 * 6)  # 10min/1h/6h, capped at the last
     LOOKBACK = 2  # read-window multiplier over the requested bar count
     MIN_LOOKBACK_DAYS = 7  # cover weekends / short holidays
 
@@ -127,6 +128,10 @@ class IncrCache:
         # Per-symbol (oldest_ts, expiry, hits): skip re-fetch when cache
         # already covers the source's oldest available date.
         self._floor = floor if floor is not None else {}
+        # Per-symbol (expiry, hits): a full-window fetch that came back
+        # unusable is not worth repeating on the next read.  Process-local on
+        # purpose — the cost of forgetting it is one re-probe.
+        self._repair: dict[str, tuple[float, int]] = {}
         self._cached_get: Callable[[str, pd.Timestamp, int], pd.DataFrame]
         if cache_ttl > 0:
             memoized: Any = ring.lru(expire=cache_ttl)(self._do_get)
@@ -228,6 +233,23 @@ class IncrCache:
     def _has_hole(self, symbol: str, df: pd.DataFrame) -> bool:
         """True when *df* misses bars over its own span, per ``is_holey``."""
         return len(df) >= 2 and self._is_holey(symbol, df)
+
+    def _cool_repair(self, symbol: str) -> None:
+        """Record a full-window fetch that came back unusable.
+
+        Same escalate-and-cap shape as the floor, and for the same reason: a
+        source that is merely having a bad minute must heal quickly, while one
+        that cannot mend the frame at all must stop being asked on every read.
+        """
+        hits = self._repair.get(symbol, (0.0, 0))[1] + 1
+        ttl = self.REPAIR_TTLS[min(hits, len(self.REPAIR_TTLS)) - 1]
+        self._repair[symbol] = (time.time() + ttl, hits)
+        log.info("repair cooldown %s: %ds (hits=%d)", symbol, ttl, hits)
+
+    def _repair_cooling(self, symbol: str) -> bool:
+        """True while the last unusable full-window fetch is still cooling."""
+        entry = self._repair.get(symbol)
+        return entry is not None and time.time() < entry[0]
 
     # ── storage ───────────────────────────────────────────────────
 
@@ -345,12 +367,23 @@ class IncrCache:
                 )
             return None
 
-        def refetch_full() -> pd.DataFrame | None:
+        def refetch_full(reason: str) -> pd.DataFrame | None:
             """Re-fetch the whole window and store it, or ``None`` when the
-            re-fetch is corrupt too and the caller should fall back."""
+            source cannot mend it and the caller should fall back.
+
+            *reason* is why the caller wants a repair; it is logged only when
+            one is actually attempted.  A re-fetch that comes back unusable
+            cools the symbol off, because the next read would otherwise ask
+            the same question and pay for the same answer.
+            """
+            if self._repair_cooling(symbol):
+                return None
+            log.warning("corrupt %s: %s, refetching", symbol, reason)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if df.empty or corrupt_reason(df):
+                self._cool_repair(symbol)
                 return None
+            self._repair.pop(symbol, None)
             self._store(symbol, df)
             return merge(existing, df)
 
@@ -370,25 +403,37 @@ class IncrCache:
         last = existing.index[-1]
         trimmed = trim(existing)
 
-        # Corrupt cache — repair with a validated full re-fetch
+        # Corrupt cache — repair with a validated full re-fetch.  A repair the
+        # source cannot deliver falls through rather than returning here: the
+        # hole is what it is, and the tail still has to stay fresh.  What the
+        # ordinary path stores from here on is the tail, whose own span
+        # excludes the hole, so it cannot widen it.
         if reason := corrupt_reason(existing):
-            log.warning("corrupt %s: %s, refetching", symbol, reason)
-            repaired = refetch_full()
-            return trimmed if repaired is None else repaired
+            repaired = refetch_full(reason)
+            if repaired is not None:
+                return repaired
 
-        # Short — not enough rows, and the source isn't known to be exhausted
-        if len(trimmed) < count and not self._at_floor(symbol, existing.index[0]):
+        # Short — not enough rows, and the source isn't known to be exhausted.
+        # A cooling symbol is skipped too: this is the same full-window ask
+        # that just came back unusable, so it would come back unusable again.
+        if (
+            len(trimmed) < count
+            and not self._at_floor(symbol, existing.index[0])
+            and not self._repair_cooling(symbol)
+        ):
             log.info("short %s: have %d, need %d", symbol, len(trimmed), count)
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             if df.empty:
                 self._set_floor(symbol, existing.index[0])
                 return trimmed
-            # Same validation as a repair — this is a full-window fetch too.
-            # A corrupt backfill is served but never stored, and never
-            # floored: it says nothing about how deep the source goes, and
-            # flooring on it would suppress the retry.
+            # Same validation as a repair — this is a full-window fetch too,
+            # so it cools off the same way.  Served but never stored, and
+            # never floored: it says nothing about how deep the source goes,
+            # and flooring on it would suppress a retry the cooldown already
+            # paces.
             if reason := corrupt_reason(df):
                 log.warning("corrupt backfill %s: %s", symbol, reason)
+                self._cool_repair(symbol)
                 return merge(existing, df)
             storable = self._complete(symbol, df)
             self._store(symbol, storable)
@@ -418,14 +463,10 @@ class IncrCache:
         # the full window; if that is corrupt too, serve it unstored.
         skipped_tail = fetch_count == gap_count and new.index[0] > last
         if skipped_tail or self._has_hole(symbol, new):
-            log.warning(
-                "discontinuous fetch %s: %s..%s vs cached tail %s, refetching",
-                symbol,
-                new.index[0],
-                new.index[-1],
-                last,
+            repaired = refetch_full(
+                f"discontinuous fetch {new.index[0]}..{new.index[-1]} "
+                f"vs cached tail {last}"
             )
-            repaired = refetch_full()
             return merge(existing, new) if repaired is None else repaired
 
         if last in new.index and new.loc[last].equals(existing.loc[last]):

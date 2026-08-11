@@ -581,6 +581,82 @@ class TestContinuity:
         lib.update.assert_not_called()
 
 
+class TestRepairCooldown:
+    """A full-window fetch that comes back unusable is not repeated on the
+    next read.
+
+    Some holes cannot be mended — the source simply does not have those bars
+    any more.  Without a cooldown that verdict is re-litigated on every single
+    read, and since the frame is never storable, it never converges: one
+    full-window fetch per read, forever.
+    """
+
+    def test_an_unmendable_frame_is_refetched_once(self, lib):
+        """The source carries the same hole, so no repair can ever land."""
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _holey_df()
+
+        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
+        for _ in range(3):
+            cache.get("S", end=datetime.date(2024, 1, 14), count=10)
+
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+        lib.update.assert_not_called()
+
+    def test_a_frame_both_holey_and_short_stops_asking_twice(self, lib):
+        """The shape seen in production: 10 bars against a 14-bar ask, with a
+        hole in them.  The short branch asks the very same full window the
+        repair just did, so it has to respect the same cooldown."""
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _holey_df()
+
+        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
+        for _ in range(3):
+            cache.get("S", end=datetime.date(2024, 1, 14), count=14)
+
+        cache._fetch.assert_called_once()  # type: ignore[union-attr]
+
+    def test_the_tail_still_advances_while_cooling(self, lib):
+        """Cooling must not freeze the symbol.  The ancient hole is beyond
+        repair, but today's bar still has to land — so the repair falls
+        through to the ordinary path instead of returning from it."""
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _holey_df()
+
+        cache = _make_cache(lib, is_holey=_gapless)
+        cache._fetch.side_effect = [  # type: ignore[union-attr]
+            _holey_df(),  # the repair, unmendable
+            _daily_df("2024-01-14", 3, value_start=400),  # the stale gap
+        ]
+        cache.get("S", end=datetime.date(2024, 1, 16), count=10)
+
+        counts = [c[0][2] for c in cache._fetch.call_args_list]  # type: ignore[union-attr]
+        assert counts == [10, 3]  # one full window, then gap-sized
+        lib.update.assert_called_once()
+
+    def test_the_cooldown_expires(self, lib):
+        """It paces the retry, it does not end it: a source that recovers has
+        to be re-probed, which is why the ladder caps instead of latching."""
+
+        class _NoWait(IncrCache):
+            REPAIR_TTLS = (0,)
+
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _holey_df()
+
+        cache = _NoWait(
+            lib,
+            MagicMock(return_value=_holey_df()),
+            get_tz=lambda _: _UTC,
+            cache_ttl=0,
+            is_holey=_gapless,
+        )
+        for _ in range(3):
+            cache.get("S", end=datetime.date(2024, 1, 14), count=10)
+
+        assert cache._fetch.call_count == 3  # type: ignore[union-attr]
+
+
 class TestWriteGuard:
     """`_store` is the integrity boundary: `update` replaces the frame's
     whole span, so a holey frame is served but never written."""
@@ -633,8 +709,16 @@ class TestWriteGuard:
         lib.update.assert_not_called()
 
     def test_refused_backfill_leaves_no_floor(self, lib):
-        """A refused backfill is no evidence of how deep the source goes —
-        flooring on it would suppress the retry until the TTL expires."""
+        """A refused backfill is no evidence of how deep the source goes, so
+        it must not floor — a floor asserts the cache already reaches the
+        source's oldest bar, and this one asserts nothing of the kind.
+
+        It does cool off: the same full-window ask just came back unusable,
+        and asking again on the next read would only buy the same answer.
+        The two are not interchangeable.  A floor keyed to a depth the source
+        never claimed would go on answering for it; a cooldown expires and
+        re-probes.
+        """
         lib.has_symbol.return_value = True
         lib.read.return_value.data = _daily_df("2024-01-05", 6)  # Jan 5-10
 
@@ -648,7 +732,8 @@ class TestWriteGuard:
         cache.get("S", end=datetime.date(2024, 1, 10), count=10)
         cache.get("S", end=datetime.date(2024, 1, 10), count=10)
 
-        assert cache._fetch.call_count == 2  # type: ignore[union-attr]  # not floored
+        assert cache._floor == {}
+        assert cache._fetch.call_count == 1  # type: ignore[union-attr]  # cooled
 
     def test_incomplete_bar_exclusion_is_idempotent(self, lib):
         """The floor decision and the store must judge the same frame. Both
