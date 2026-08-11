@@ -634,6 +634,67 @@ class TestRepairCooldown:
         assert counts == [10, 3]  # one full window, then gap-sized
         lib.update.assert_called_once()
 
+    def test_a_holey_first_write_is_stored(self, lib):
+        """With nothing in the store, the write guard has nothing to defend —
+        and refusing would be permanent, since the frame is never stored, so
+        every later read is another miss and another full-window fetch."""
+        lib.has_symbol.return_value = False  # nothing to overwrite
+
+        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
+        cache.get("S", end=datetime.date(2024, 1, 14), count=10)
+
+        lib.update.assert_called_once()
+
+    def test_a_read_error_still_refuses(self, lib):
+        """``_read`` reports an unreadable symbol as an empty frame, so the
+        miss branch is also where a store outage lands.  Rows may well exist
+        outside the read window, and a holey write would land on top of them:
+        ``has_symbol``, not emptiness, is what says the store is untouched."""
+        lib.has_symbol.return_value = True
+        lib.read.side_effect = RuntimeError("store down")
+
+        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
+        cache.get("S", end=datetime.date(2024, 1, 14), count=10)
+
+        lib.update.assert_not_called()
+
+    def test_one_depth_cooling_does_not_stall_another(self, lib):
+        """Callers ask the same cache for several window depths.  A holey
+        1000-bar window says nothing about a 10-bar one, so suppressing both
+        on one verdict would trade a fetch loop for a stall."""
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _holey_df()
+
+        cache = _make_cache(lib, _holey_df(), is_holey=_gapless)
+        cache.get("S", end=datetime.date(2024, 1, 14), count=14)
+        cache.get("S", end=datetime.date(2024, 1, 14), count=20)
+
+        assert cache._fetch.call_count == 2  # type: ignore[union-attr]
+
+    def test_a_clean_backfill_resets_the_ladder(self, lib):
+        """The ladder measures consecutive failure.  A recovery that lands
+        through the short branch has to clear it, or the next unrelated
+        failure starts at the rung this one reached."""
+
+        class _NoWait(IncrCache):
+            REPAIR_TTLS = (0,)
+
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = _daily_df("2024-01-05", 6)  # clean, short
+
+        cache = _NoWait(
+            lib,
+            MagicMock(side_effect=[_holey_df(), _daily_df("2024-01-01", 10)]),
+            get_tz=lambda _: _UTC,
+            cache_ttl=0,
+            is_holey=_gapless,
+        )
+        cache.get("S", end=datetime.date(2024, 1, 10), count=10)
+        assert cache._repair  # the corrupt backfill cooled it
+
+        cache.get("S", end=datetime.date(2024, 1, 10), count=10)
+        assert cache._repair == {}
+
     def test_the_cooldown_expires(self, lib):
         """It paces the retry, it does not end it: a source that recovers has
         to be re-probed, which is why the ladder caps instead of latching."""
