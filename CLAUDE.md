@@ -34,7 +34,8 @@ Tests split by layer, one behaviour one home: `tests/bdd/` states the cache's ru
 5. **Fresh** — cached data covers the requested range: return from cache
 6. **Stale** — compute gap size, fetch only new bars, merge with existing, offer to `_store()`
 
-A fetched frame is never withheld from the caller. The source is
+A fetched frame is never withheld from the caller — an empty one aside, which
+replaces nothing and leaves the cached rows serving. The source is otherwise
 authoritative: whatever it returns is the data, and a cache that second-
 guesses it has no higher court to appeal to — it can only ask again, which is
 a loop with no exit. Bad source data is the consumer's problem. The frame is

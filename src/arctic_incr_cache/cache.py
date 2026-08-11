@@ -400,11 +400,13 @@ class IncrCache:
         def full_fetch() -> pd.DataFrame:
             """Fetch the whole window and offer it to the store.
 
-            What comes back goes to the caller as it is.  The source is
-            authoritative — if it cannot supply the span, no one downstream
-            can, and a cache that withheld the frame would leave the caller
-            with nothing rather than with less.  Whether it is also *stored*
-            is a separate question, and ``_store``'s.
+            What comes back goes to the caller as it is, unless nothing came
+            back — an empty answer replaces nothing, so the cached rows still
+            serve.  Otherwise the source is authoritative: if it cannot supply
+            the span, no one downstream can, and a cache that withheld the
+            frame would leave the caller with nothing rather than with less.
+            Whether it is also *stored* is a separate question, and
+            ``_store``'s.
             """
             df = _normalize(self._fetch(symbol, end_ts, count), tz)
             self._store(symbol, df)

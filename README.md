@@ -117,7 +117,9 @@ the read may pull more rows than the ask, and the hook grades the ask.
 - **On read** — a holey stored window is re-fetched. No frame written here
   contained that gap, so only the source can say what belongs in it.
 
-Either way the frame reaches the caller. Refusing a write never drops data.
+Either way the frame reaches the caller — refusing a write never drops data.
+A fetch that comes back empty is the one exception, and it drops nothing
+either: an empty answer replaces nothing, so the cached rows go on serving.
 
 ```python
 import math
