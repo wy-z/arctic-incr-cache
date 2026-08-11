@@ -645,6 +645,30 @@ class TestRepairCooldown:
 
         lib.update.assert_called_once()
 
+    def test_the_verdict_matches_what_the_store_judges(self, lib):
+        """Decided on the frame ``_store`` writes, not the window served.
+
+        A source over-returning a holey prefix reads as a clean fetch when
+        only the delivered window is checked, and is refused at the store —
+        success by one measure, nothing written by the other, and a full
+        re-fetch on every read for as long as it lasts.
+        """
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = pd.DataFrame()  # rows, outside this window
+        over_returned = pd.concat(
+            [
+                _daily_df("2024-01-01", 2),
+                _daily_df("2024-01-07", 2, value_start=200),  # Jan 3-6 missing
+                _daily_df("2024-01-09", 6, value_start=300),  # clean tail
+            ]
+        )
+
+        cache = _make_cache(lib, over_returned, is_holey=_gapless)
+        cache.get("S", end=datetime.date(2024, 1, 14), count=6)
+
+        lib.update.assert_not_called()
+        assert cache._repair  # cooled, not banked as a success
+
     def test_a_read_error_still_refuses(self, lib):
         """``_read`` reports an unreadable symbol as an empty frame, so the
         miss branch is also where a store outage lands.  Rows may well exist
@@ -735,7 +759,15 @@ class TestWriteGuard:
 
     def test_refuses_hole_outside_the_delivered_window(self, lib):
         """The guard checks the frame being written, not the window being
-        served: a source over-returning holey history must not be stored."""
+        served: a source over-returning holey history must not land on top of
+        rows already in the store.
+
+        ``has_symbol`` with an empty read is the shape that matters here —
+        rows exist, they just fall outside this window, so the delivered
+        window looking clean is no licence to write the rest.
+        """
+        lib.has_symbol.return_value = True
+        lib.read.return_value.data = pd.DataFrame()
         older = pd.concat(
             [
                 _daily_df("2024-01-01", 2),
